@@ -28,7 +28,7 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 
-from ssrt.surface.aiem import AIEM
+from ssrt.surface.aiem import AIEMModel, AIEMParameters
 from ssrt.utils.util import toLambda
 
 # Default configuration mirrors the notebook
@@ -57,6 +57,57 @@ class Metrics:
             f"Bias={self.bias:+5.2f} dB  "
             f"Corr={self.corr:6.3f}"
         )
+
+
+@dataclass
+class CrossPolComponentEntry:
+    ratio: float
+    kc: float
+    c: float
+    multiple: float
+    model_total: float
+    reference: float
+
+
+@dataclass
+class CrossPolComponentStats:
+    count: int
+    kc: float
+    c: float
+    multiple: float
+    model_total: float
+    reference: float
+
+    def format_row(self, label: str) -> str:  # pragma: no cover - trivial formatting
+        if self.count == 0:
+            return f"{label:<8s} n=  0  (no data)"
+
+        def _format_power(value: float) -> str:
+            eps = 1e-12
+            magnitude = abs(value)
+            if magnitude <= 0.0:
+                return "-inf dB"
+            db = 10.0 * math.log10(magnitude + eps)
+            sign = "+" if value >= 0.0 else "-"
+            return f"{sign}{abs(db):5.2f} dB"
+
+        ratio = (self.multiple / self.reference) if self.reference != 0.0 else float("nan")
+
+        return (
+            f"{label:<8s} n={self.count:3d}  "
+            f"kc={_format_power(self.kc):>11s}  "
+            f"c={_format_power(self.c):>11s}  "
+            f"mult={_format_power(self.multiple):>11s}  "
+            f"AIEM={_format_power(self.model_total):>11s}  "
+            f"REF={_format_power(self.reference):>11s}  "
+            f"mult/ref={ratio:6.3f}"
+        )
+
+
+@dataclass
+class CrossPolDiagnostics:
+    overall: CrossPolComponentStats
+    by_ratio: Dict[float, CrossPolComponentStats]
 
 
 def _load_lut(path: Path) -> np.ndarray:
@@ -89,10 +140,40 @@ def _calc_metrics(model: Iterable[float], reference: Iterable[float]) -> Metrics
     return Metrics(count=int(mask.sum()), rmse=rmse, mae=mae, bias=bias, corr=corr)
 
 
+def _aggregate_component_entries(
+    entries: Iterable[CrossPolComponentEntry],
+) -> CrossPolComponentStats:
+    entry_list = list(entries)
+    if not entry_list:
+        return CrossPolComponentStats(
+            count=0,
+            kc=0.0,
+            c=0.0,
+            multiple=0.0,
+            model_total=0.0,
+            reference=0.0,
+        )
+
+    count = len(entry_list)
+
+    def _mean(attr: str) -> float:
+        return float(sum(getattr(entry, attr) for entry in entry_list) / count)
+
+    return CrossPolComponentStats(
+        count=count,
+        kc=_mean("kc"),
+        c=_mean("c"),
+        multiple=_mean("multiple"),
+        model_total=_mean("model_total"),
+        reference=_mean("reference"),
+    )
+
+
 @dataclass
 class ComparisonResult:
     overall: Dict[str, Metrics]
     by_ratio: Dict[float, Dict[str, Metrics]]
+    cross_pol: CrossPolDiagnostics | None = None
 
 
 def _run_comparison(
@@ -103,6 +184,7 @@ def _run_comparison(
     surface_type: int,
     ratios: Sequence[float] | None,
     include_multiple: bool,
+    diagnose_cross_pol: bool,
 ) -> ComparisonResult:
     lam = toLambda(frequency_ghz)
     k = 2.0 * math.pi / lam
@@ -111,6 +193,9 @@ def _run_comparison(
     overall_reference: Dict[str, List[float]] = {pol: [] for pol in ("hh", "vv", "hv")}
     grouped_model: Dict[float, Dict[str, List[float]]] = {}
     grouped_reference: Dict[float, Dict[str, List[float]]] = {}
+
+    component_entries: List[CrossPolComponentEntry] = []
+    component_entries_by_ratio: Dict[float, List[CrossPolComponentEntry]] = {}
 
     for row in rows:
         (
@@ -130,19 +215,30 @@ def _run_comparison(
 
         sigma = rms_norm * lam
         corr_len = ratio * sigma
-        hh_db, vv_db, hv_db, _ = AIEM(
+        params = AIEMParameters(
             theta_i=incidence_deg,
             theta_s=incidence_deg,
             phi_s=phi_deg,
             err=float(eps_r),
             eri=float(eps_i),
-            itype=surface_type,
-            addMultiple=include_multiple,
+            surface_type=surface_type,
+            add_multiple=include_multiple,
+            output_unit="linear",
             frequency_ghz=frequency_ghz,
             k0=k,
             sigma=sigma,
             corr_len=corr_len,
         )
+        model = AIEMModel(params)
+        totals_linear = model.sigma0_total()
+
+        hh_lin = float(totals_linear["hh"])
+        vv_lin = float(totals_linear["vv"])
+        hv_lin = float(totals_linear["hv"])
+
+        hh_db = AIEMModel._to_db(hh_lin)
+        vv_db = AIEMModel._to_db(vv_lin)
+        hv_db = AIEMModel._to_db(hv_lin)
 
         overall_model["hh"].append(hh_db)
         overall_model["vv"].append(vv_db)
@@ -164,6 +260,24 @@ def _run_comparison(
         grouped_reference[ratio]["vv"].append(vv_ref)
         grouped_reference[ratio]["hv"].append(hv_ref)
 
+        if include_multiple and diagnose_cross_pol:
+            components = model.multiple_scattering_components()
+            hv_components = components.get("hv") or components.get("vh")
+            if hv_components is None:
+                hv_components = {"kc": 0.0, "c": 0.0}
+            hv_multiple = float(hv_components["kc"] + hv_components["c"])
+            hv_ref_linear = float(10 ** (hv_ref / 10.0))
+            entry = CrossPolComponentEntry(
+                ratio=ratio,
+                kc=float(hv_components["kc"]),
+                c=float(hv_components["c"]),
+                multiple=hv_multiple,
+                model_total=hv_lin,
+                reference=hv_ref_linear,
+            )
+            component_entries.append(entry)
+            component_entries_by_ratio.setdefault(ratio, []).append(entry)
+
     overall_metrics = {
         pol: _calc_metrics(overall_model[pol], overall_reference[pol]) for pol in overall_model
     }
@@ -175,7 +289,17 @@ def _run_comparison(
             for pol in model_dict
         }
 
-    return ComparisonResult(overall=overall_metrics, by_ratio=by_ratio)
+    diagnostics = None
+    if include_multiple and diagnose_cross_pol:
+        diagnostics = CrossPolDiagnostics(
+            overall=_aggregate_component_entries(component_entries),
+            by_ratio={
+                ratio_value: _aggregate_component_entries(entries)
+                for ratio_value, entries in component_entries_by_ratio.items()
+            },
+        )
+
+    return ComparisonResult(overall=overall_metrics, by_ratio=by_ratio, cross_pol=diagnostics)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -227,6 +351,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include the multiple scattering contribution in AIEM evaluations",
     )
+    parser.add_argument(
+        "--diagnose-cross-pol",
+        action="store_true",
+        help="Report average multiple-scattering kc/c contributions for the HV channel",
+    )
     return parser
 
 
@@ -251,6 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         surface_type=args.surface_type,
         ratios=args.ratios,
         include_multiple=args.add_multiple,
+        diagnose_cross_pol=args.diagnose_cross_pol,
     )
 
     overall = result.overall
@@ -265,6 +395,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"\nℓ/σ = {ratio:g}")
             for pol in ("vv", "hh", "hv"):
                 print(result.by_ratio[ratio][pol].format_row(pol.upper()))
+
+    if args.diagnose_cross_pol:
+        if not args.add_multiple:
+            print(
+                "\nCross-pol diagnostics requested but multiple scattering is disabled; "
+                "enable --add-multiple to inspect kc/c contributions."
+            )
+        elif result.cross_pol is not None:
+            print("\nCross-pol multiple-scattering diagnostics (mean linear power)")
+            print(result.cross_pol.overall.format_row("Overall"))
+            if result.cross_pol.by_ratio:
+                for ratio in sorted(result.cross_pol.by_ratio):
+                    label = f"ℓ/σ={ratio:g}"
+                    print(result.cross_pol.by_ratio[ratio].format_row(label))
 
     total_valid = sum(metrics.count for metrics in overall.values())
     if total_valid == 0:

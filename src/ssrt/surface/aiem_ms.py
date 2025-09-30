@@ -62,7 +62,7 @@ def compute_multiple_scattering(
     polarisations: Sequence[str] = ("hh", "vv", "hv", "vh"),
     n_points: int = 129,
     nmax: int = 8,
-) -> Dict[str, float]:
+) -> tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
     """Evaluate multiple-scattering contributions for the requested polarisations."""
 
     geom = Geometry(theta_i=theta_i, theta_s=theta_s, phi_i=phi_i, phi_s=phi_s)
@@ -151,11 +151,15 @@ class _MultipleScatteringIntegrator:
         W2D = np.outer(wu, wv)
 
         results: Dict[str, float] = {pol: 0.0 for pol in self.pols}
+        components: Dict[str, Dict[str, float]] = {
+            pol: {"kc": 0.0, "c": 0.0} for pol in self.pols
+        }
         hv_value: float | None = None
 
         for pol in self.pols:
             if pol in {"hv", "vh"} and hv_value is not None:
                 results[pol] = hv_value
+                components[pol] = components.get("hv", {"kc": 0.0, "c": 0.0}).copy()
                 continue
 
             integrand_kc, integrand_c = _assemble_integrands(
@@ -173,33 +177,30 @@ class _MultipleScatteringIntegrator:
                 pol,
             )
 
+            Ikc = np.real(integrand_kc) * rad
+            Ic = np.real(integrand_c) * rad
+            kc_term = (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D)
+            c_term = (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
+
+            kc_linear = float(np.real(kc_term))
+            c_linear = float(np.real(c_term))
+
+            components[pol] = {"kc": kc_linear, "c": c_linear}
+
             if pol in {"hh", "vv"}:
-                Ikc = np.real(integrand_kc) * rad
-                Ic = np.real(integrand_c) * rad
-                val = (
-                    (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D)
-                    + (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
-                )
-                results[pol] = max(float(np.real(val)), 0.0)
+                total_linear = kc_linear + c_linear
+                results[pol] = max(total_linear, 0.0)
 
             elif pol in {"hv", "vh"}:
-                Ikc = np.real(integrand_kc) * rad
-                Ic = np.real(integrand_c) * rad
-                val = (
-                    (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D)
-                    + (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
-                )
-                raw_linear = float(np.real(val))
-                if raw_linear >= 0.0:
-                    hv_linear = raw_linear
-                else:
-                    roughness_ratio = self.surf.sigma / max(self.surf.corr_len, 1e-12)
-                    hv_linear = (roughness_ratio**2) * abs(raw_linear)
-                hv_value = max(hv_linear, 0.0)
+                raw_linear = kc_linear + c_linear
+                hv_linear = raw_linear if raw_linear >= 0.0 else abs(raw_linear)
+                hv_value = hv_linear
                 results["hv"] = hv_value
                 results["vh"] = hv_value
+                components["hv"] = {"kc": kc_linear, "c": c_linear}
+                components["vh"] = {"kc": kc_linear, "c": c_linear}
 
-        return results
+        return results, components
 
 
 def _prepare_geometry_terms(geom: Geometry, phys: Physics) -> Dict[str, float]:

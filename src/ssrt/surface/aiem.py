@@ -106,6 +106,7 @@ class AIEMModel:
 
         self._single_cache: SingleScatteringBreakdown | None = None
         self._multiple_cache: Dict[str, float] | None = None
+        self._multiple_components_cache: Dict[str, Dict[str, float]] | None = None
         self._eq10_cache: Dict[str, np.ndarray] | None = None
         self._wavevector_cache: Dict[str, np.ndarray | int | float] | None = None
         self._kirchhoff_cache: Dict[str, Dict[str, float | complex]] | None = None
@@ -184,7 +185,7 @@ class AIEMModel:
 
         surface_label = "gauss" if self.params.surface_type == 1 else "exp"
         pols = ("hh", "vv", "hv", "vh")
-        contributions = compute_multiple_scattering(
+        contributions, components = compute_multiple_scattering(
             theta_i=self.theta_i,
             theta_s=self.theta_s,
             phi_i=self.phi_i,
@@ -197,7 +198,19 @@ class AIEMModel:
             polarisations=pols,
         )
         self._multiple_cache = contributions
+        self._multiple_components_cache = components
         return contributions
+
+    def multiple_scattering_components(self) -> Dict[str, Dict[str, float]]:
+        """Return cached multiple-scattering kc/c components (linear power)."""
+
+        if self._multiple_cache is None or self._multiple_components_cache is None:
+            self.sigma0_multiple()
+
+        assert self._multiple_components_cache is not None  # narrow type for mypy
+        return {
+            pol: comps.copy() for pol, comps in self._multiple_components_cache.items()
+        }
 
     def _compute_wavenumber(self, params: AIEMParameters) -> float:
         """Determine the physical wavenumber from frequency or explicit input."""
