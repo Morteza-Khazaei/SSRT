@@ -134,8 +134,6 @@ def _run_comparison(
             theta_i=incidence_deg,
             theta_s=incidence_deg,
             phi_s=phi_deg,
-            kl=None,
-            ks=None,
             err=float(eps_r),
             eri=float(eps_i),
             itype=surface_type,

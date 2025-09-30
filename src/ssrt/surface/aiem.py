@@ -30,8 +30,6 @@ class AIEMParameters:
     err: float
     eri: float
     surface_type: int
-    kl: float | None = None
-    ks: float | None = None
     add_multiple: bool = False
     output_unit: str = "dB"
     frequency_ghz: float | None = None
@@ -40,10 +38,10 @@ class AIEMParameters:
     corr_len: float | None = None
 
     def __post_init__(self) -> None:
-        if self.ks is None and self.sigma is None:
-            raise ValueError("Either ks or sigma must be provided")
-        if self.kl is None and self.corr_len is None:
-            raise ValueError("Either kl or corr_len must be provided")
+        if self.sigma is None:
+            raise ValueError("sigma (surface RMS height in metres) must be provided")
+        if self.corr_len is None:
+            raise ValueError("corr_len (surface correlation length in metres) must be provided")
 
 
 @dataclass(frozen=True)
@@ -97,17 +95,8 @@ class AIEMModel:
         # Physical wavenumber and dimensional roughness descriptors
         self.k0 = self._compute_wavenumber(params)
 
-        if params.sigma is not None:
-            self.sigma = params.sigma
-        else:
-            assert params.ks is not None  # ensured by AIEMParameters.__post_init__
-            self.sigma = params.ks / self.k0
-
-        if params.corr_len is not None:
-            self.corr_len = params.corr_len
-        else:
-            assert params.kl is not None
-            self.corr_len = params.kl / self.k0
+        self.sigma = params.sigma
+        self.corr_len = params.corr_len
 
         # Roughness parameters (dimensionless, built from k0)
         self.ks = self.k0 * self.sigma
@@ -1026,34 +1015,29 @@ def AIEM(
     theta_i: float,
     theta_s: float,
     phi_s: float,
-    kl: float | None,
-    ks: float | None,
     err: float,
     eri: float,
     itype: int,
+    *,
     addMultiple: bool = False,
     output_unit: str = "dB",
-    *,
     frequency_ghz: float | None = None,
     k0: float | None = None,
     sigma: float | None = None,
     corr_len: float | None = None,
 ) -> Tuple[float, float, float, float]:
-    """Convenience wrapper matching the historical MATLAB signature.
+    """Convenience wrapper for the historical MATLAB driver.
 
-    The legacy interface supplied the dimensionless roughness terms ``kl`` and
-    ``ks`` directly.  When using the new ``frequency_ghz``/``k0`` inputs together
-    with dimensional roughness descriptors (``sigma`` in metres, ``corr_len`` in
-    metres), pass ``None`` for ``kl`` and ``ks`` and they will be rebuilt from
-    the physical wavenumber inside the solver.
+    Provide the surface roughness via the dimensional descriptors ``sigma``
+    (surface RMS height, metres) and ``corr_len`` (correlation length, metres).
+    The solver rebuilds the dimensionless parameters internally using the
+    physical wavenumber derived from ``frequency_ghz`` or ``k0``.
     """
 
     params = AIEMParameters(
         theta_i=theta_i,
         theta_s=theta_s,
         phi_s=phi_s,
-        kl=kl,
-        ks=ks,
         err=err,
         eri=eri,
         surface_type=itype,
