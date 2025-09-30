@@ -12,10 +12,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+import logging
+import math
+import time
+
 import numpy as np
 from scipy.special import gammaln, kv
 
 from .aiem_ms import compute_multiple_scattering
+
+
+logger = logging.getLogger(__name__)
+
+C0 = 299_792_458.0  # speed of light in vacuum (m/s)
 
 
 @dataclass(frozen=True)
@@ -25,13 +34,21 @@ class AIEMParameters:
     theta_i: float
     theta_s: float
     phi_s: float
-    kl: float
-    ks: float
     err: float
     eri: float
     surface_type: int
     add_multiple: bool = False
     output_unit: str = "dB"
+    frequency_ghz: float | None = None
+    k0: float | None = None
+    sigma: float | None = None
+    corr_len: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.sigma is None:
+            raise ValueError("sigma (surface RMS height in metres) must be provided")
+        if self.corr_len is None:
+            raise ValueError("corr_len (surface correlation length in metres) must be provided")
 
 
 @dataclass(frozen=True)
@@ -82,14 +99,21 @@ class AIEMModel:
         self.cs2 = self.cs**2
         self.css2 = self.css**2
 
-        # Roughness parameters (dimensionless)
-        self.ks = params.ks
-        self.ks2 = params.ks**2
-        self.kl = params.kl
-        self.kl2 = params.kl**2
+        # Physical wavenumber and dimensional roughness descriptors
+        self.k0 = self._compute_wavenumber(params)
+
+        self.sigma = params.sigma
+        self.corr_len = params.corr_len
+
+        # Roughness parameters (dimensionless, built from k0)
+        self.ks = self.k0 * self.sigma
+        self.ks2 = self.ks**2
+        self.kl = self.k0 * self.corr_len
+        self.kl2 = self.kl**2
 
         self._single_cache: SingleScatteringBreakdown | None = None
         self._multiple_cache: Dict[str, float] | None = None
+        self._multiple_components_cache: Dict[str, Dict[str, float]] | None = None
         self._eq10_cache: Dict[str, np.ndarray] | None = None
         self._wavevector_cache: Dict[str, np.ndarray | int | float] | None = None
         self._kirchhoff_cache: Dict[str, Dict[str, float | complex]] | None = None
@@ -168,19 +192,92 @@ class AIEMModel:
 
         surface_label = "gauss" if self.params.surface_type == 1 else "exp"
         pols = ("hh", "vv", "hv", "vh")
-        contributions = compute_multiple_scattering(
+        if self._kirchhoff_cache is None:
+            # Ensure Kirchhoff fields are available for the kc cross term
+            self.sigma0_single()
+
+        assert self._kirchhoff_cache is not None
+        kirchhoff_fields = self._kirchhoff_cache["fields"]
+
+        freq_ghz = self.params.frequency_ghz
+        if freq_ghz is None:
+            freq_ghz = (self.k0 * C0) / (2.0 * math.pi * 1e9)
+
+        n_points = 65
+        nmax = 8
+        start = time.perf_counter()
+        logger.info(
+            (
+                "AIEM multiple scattering start: freq=%.3f GHz, theta_i=%.2f°, "
+                "sigma=%.4f m, corr_len=%.4f m, surface=%s, grid=%dx%d, Nmax=%d"
+            ),
+            freq_ghz,
+            math.degrees(self.theta_i),
+            self.sigma,
+            self.corr_len,
+            surface_label,
+            n_points,
+            n_points,
+            nmax,
+        )
+
+        contributions, components = compute_multiple_scattering(
             theta_i=self.theta_i,
             theta_s=self.theta_s,
             phi_i=self.phi_i,
             phi_s=self.phi_s,
             er=self.er,
-            ks=self.ks,
-            kl=self.kl,
+            k0=self.k0,
+            sigma=self.sigma,
+            corr_len=self.corr_len,
             surface_label=surface_label,
             polarisations=pols,
+            kirchhoff_fields=kirchhoff_fields,
+            n_points=n_points,
+            nmax=nmax,
+        )
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "AIEM multiple scattering complete in %.2f s (%.3f s per polarisation)",
+            elapsed,
+            elapsed / max(len(pols), 1),
         )
         self._multiple_cache = contributions
+        self._multiple_components_cache = components
         return contributions
+
+    def multiple_scattering_components(self) -> Dict[str, Dict[str, float]]:
+        """Return cached multiple-scattering kc/c components (linear power)."""
+
+        if self._multiple_cache is None or self._multiple_components_cache is None:
+            self.sigma0_multiple()
+
+        assert self._multiple_components_cache is not None  # narrow type for mypy
+        return {
+            pol: comps.copy() for pol, comps in self._multiple_components_cache.items()
+        }
+
+    def _compute_wavenumber(self, params: AIEMParameters) -> float:
+        """Determine the physical wavenumber from frequency or explicit input."""
+
+        if params.frequency_ghz is not None:
+            if params.frequency_ghz <= 0.0:
+                raise ValueError("frequency_ghz must be positive when provided")
+            lam = C0 / (params.frequency_ghz * 1e9)
+            k0 = 2.0 * math.pi / lam
+        elif params.k0 is not None:
+            k0 = params.k0
+        else:
+            k0 = 1.0
+
+        if params.add_multiple and params.frequency_ghz is None and params.k0 is None:
+            raise ValueError(
+                "frequency_ghz or k0 must be provided when multiple scattering is enabled"
+            )
+        if k0 <= 0.0:
+            raise ValueError("k0 must be positive")
+
+        return k0
 
     def set_propagation_branch(self, z: float, zp: float) -> str:
         """Eq. (5): Return propagation branch '+' (upward) or '-' (downward)."""
@@ -975,27 +1072,38 @@ def AIEM(
     theta_i: float,
     theta_s: float,
     phi_s: float,
-    kl: float,
-    ks: float,
     err: float,
     eri: float,
     itype: int,
+    *,
     addMultiple: bool = False,
     output_unit: str = "dB",
+    frequency_ghz: float | None = None,
+    k0: float | None = None,
+    sigma: float | None = None,
+    corr_len: float | None = None,
 ) -> Tuple[float, float, float, float]:
-    """Convenience wrapper matching the historical MATLAB signature."""
+    """Convenience wrapper for the historical MATLAB driver.
+
+    Provide the surface roughness via the dimensional descriptors ``sigma``
+    (surface RMS height, metres) and ``corr_len`` (correlation length, metres).
+    The solver rebuilds the dimensionless parameters internally using the
+    physical wavenumber derived from ``frequency_ghz`` or ``k0``.
+    """
 
     params = AIEMParameters(
         theta_i=theta_i,
         theta_s=theta_s,
         phi_s=phi_s,
-        kl=kl,
-        ks=ks,
         err=err,
         eri=eri,
         surface_type=itype,
         add_multiple=addMultiple,
         output_unit=output_unit,
+        frequency_ghz=frequency_ghz,
+        k0=k0,
+        sigma=sigma,
+        corr_len=corr_len,
     )
     result = AIEMModel(params).compute()
     return result.hh, result.vv, result.hv, result.vh

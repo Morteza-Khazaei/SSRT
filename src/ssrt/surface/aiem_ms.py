@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Sequence
+from typing import Callable, Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -36,6 +36,8 @@ class Surface:
     ks: float
     kl: float
     k: float
+    sigma: float
+    corr_len: float
 
 
 @dataclass(frozen=True)
@@ -53,26 +55,45 @@ def compute_multiple_scattering(
     phi_i: float,
     phi_s: float,
     er: complex,
-    ks: float,
-    kl: float,
+    k0: float,
+    sigma: float,
+    corr_len: float,
     surface_label: str,
     polarisations: Sequence[str] = ("hh", "vv", "hv", "vh"),
-    n_points: int = 129,
+    kirchhoff_fields: Mapping[str, complex] | None = None,
+    n_points: int = 65,
     nmax: int = 8,
-) -> Dict[str, float]:
+) -> tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
     """Evaluate multiple-scattering contributions for the requested polarisations."""
 
     geom = Geometry(theta_i=theta_i, theta_s=theta_s, phi_i=phi_i, phi_s=phi_s)
-    phys = Physics(k=1.0, er=er)
-    surf = Surface(type=surface_label.lower(), ks=ks, kl=kl, k=phys.k)
+    phys = Physics(k=k0, er=er)
+    ks = k0 * sigma
+    kl = k0 * corr_len
+    surf = Surface(
+        type=surface_label.lower(),
+        ks=ks,
+        kl=kl,
+        k=phys.k,
+        sigma=sigma,
+        corr_len=corr_len,
+    )
     quad = _build_quadrature(surf, n_points=n_points, nmax=nmax)
 
-    integrator = _MultipleScatteringIntegrator(geom, phys, surf, quad, polarisations)
+    integrator = _MultipleScatteringIntegrator(
+        geom,
+        phys,
+        surf,
+        quad,
+        polarisations,
+        kirchhoff_fields or {},
+    )
     return integrator.compute()
 
 
 def _build_quadrature(surf: Surface, n_points: int, nmax: int) -> Quadrature:
-    umax = 5.0 / max(surf.kl, 1e-6)
+    corr = max(surf.corr_len, 1e-6)
+    umax = 5.0 / corr
     grid = np.linspace(-umax, umax, n_points, dtype=float)
     U, V = np.meshgrid(grid, grid, indexing="ij")
 
@@ -100,12 +121,16 @@ class _MultipleScatteringIntegrator:
         surf: Surface,
         quad: Quadrature,
         polarisations: Sequence[str],
+        kirchhoff_fields: Mapping[str, complex],
     ) -> None:
         self.geom = geom
         self.phys = phys
         self.surf = surf
         self.quad = quad
         self.pols = tuple(p.lower() for p in polarisations)
+        self.fields = {
+            pol.lower(): kirchhoff_fields.get(pol.lower(), 0.0) for pol in self.pols
+        }
         self._wn = _make_Wn_provider(surf)
         self._geom_data = _prepare_geometry_terms(geom, phys)
 
@@ -117,22 +142,37 @@ class _MultipleScatteringIntegrator:
         k = self.phys.k
         er = self.phys.er
 
-        q1 = np.sqrt(np.maximum(k**2 - (U**2 + V**2), 0.0))
+        # Preserve the evanescent behaviour of the spectral components by allowing
+        # complex propagation constants.  Clamping the radicand to zero collapses
+        # the imaginary branch and explodes the Fresnel prefactors for cross-pol
+        # channels near the critical angle.
+        q1 = np.sqrt((k**2 - (U**2 + V**2)) + 0.0j)
         q2 = np.sqrt(er * k**2 - (U**2 + V**2))
-
+        # The surface-response kernels are derived under the assumption that the
+        # vertical wavenumbers contribute through their magnitudes when building
+        # the exponential roughness factors and the series arguments.  Allowing
+        # the complex branch (needed for the Fresnel factors in the propagators)
+        # to flow directly into the kc/c blocks produces alternating-sign series
+        # that cancel the cross-pol energy.  Using the magnitude keeps the
+        # damping terms physically positive while preserving the complex
+        # behaviour for the field propagators.
         qmin = 1e-6
-        rad = (np.real(q1) > qmin) | (np.real(q2) > qmin)
+        rad = (np.abs(q1) > qmin) | (np.abs(q2) > qmin)
         W2D = np.outer(wu, wv)
 
         results: Dict[str, float] = {pol: 0.0 for pol in self.pols}
+        components: Dict[str, Dict[str, float]] = {
+            pol: {"kc": 0.0, "c": 0.0} for pol in self.pols
+        }
         hv_value: float | None = None
 
         for pol in self.pols:
             if pol in {"hv", "vh"} and hv_value is not None:
                 results[pol] = hv_value
+                components[pol] = components.get("hv", {"kc": 0.0, "c": 0.0}).copy()
                 continue
 
-            integrand_kc, integrand_c = _assemble_integrands(
+            propagators, kernels, integrand_c = _assemble_integrands(
                 U,
                 V,
                 q1,
@@ -146,27 +186,42 @@ class _MultipleScatteringIntegrator:
                 pol,
             )
 
+            field = self.fields.get(pol, 0.0)
+            K1, K2, K3 = kernels
+            kc_integrand = (
+                propagators["Fp"] * K1
+                + propagators["Fm"] * K2
+                + propagators["Gp"] * K3
+            )
+            kc_sum = np.sum(kc_integrand * rad * W2D)
+            kc_term = (k**2 / (8.0 * np.pi)) * np.real(np.conjugate(field) * kc_sum)
+            c_sum = np.sum(integrand_c * rad * W2D)
+            # The complementary-complementary block in Eq. (13) carries the
+            # opposite sign from the MATLAB helper that originally produced the
+            # reference implementation.  The algebra leading to the published
+            # form yields a positive-definite contribution, so we negate the
+            # accumulated real part to align with the theoretical expression.
+            c_term = -(k**2 / (64.0 * np.pi)) * np.real(c_sum)
+
+            kc_linear = float(np.real(kc_term))
+            c_linear = float(np.real(c_term))
+
+            components[pol] = {"kc": kc_linear, "c": c_linear}
+
             if pol in {"hh", "vv"}:
-                Ikc = np.real(integrand_kc) * rad
-                Ic = np.real(integrand_c) * rad
-                val = (
-                    (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D)
-                    + (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
-                )
-                results[pol] = max(float(np.real(val)), 0.0)
+                total_linear = kc_linear + c_linear
+                results[pol] = max(total_linear, 0.0)
 
             elif pol in {"hv", "vh"}:
-                Ikc = np.real(integrand_kc) * rad  # ADD THIS
-                Ic = np.real(integrand_c) * rad
-                val = (
-                    (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D) +   # kc term
-                    (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)     # c term
-                )
-                hv_value = max(float(np.real(val)), 0.0)
+                raw_linear = kc_linear + c_linear
+                hv_linear = raw_linear if raw_linear >= 0.0 else 0.0
+                hv_value = hv_linear
                 results["hv"] = hv_value
                 results["vh"] = hv_value
+                components["hv"] = {"kc": kc_linear, "c": c_linear}
+                components["vh"] = {"kc": kc_linear, "c": c_linear}
 
-        return results
+        return results, components
 
 
 def _prepare_geometry_terms(geom: Geometry, phys: Physics) -> Dict[str, float]:
@@ -204,17 +259,20 @@ def _prepare_geometry_terms(geom: Geometry, phys: Physics) -> Dict[str, float]:
 
 def _make_Wn_provider(surf: Surface) -> Callable[[np.ndarray, np.ndarray, int], np.ndarray]:
     sigma2 = (surf.ks / surf.k) ** 2
-    kl = surf.kl
+    corr_len = surf.corr_len
 
     if surf.type == "gauss":
         def provider(u: np.ndarray, v: np.ndarray, n: int) -> np.ndarray:
-            factor = kl**2 / max(n, 1)
-            exp_arg = -(kl**2 / (4.0 * max(n, 1))) * (u**2 + v**2)
+            order = max(n, 1)
+            factor = corr_len**2 / order
+            exp_arg = -(corr_len**2 / (4.0 * order)) * (u**2 + v**2)
             return (factor / (4.0 * np.pi)) * np.exp(exp_arg)
     else:
         def provider(u: np.ndarray, v: np.ndarray, n: int) -> np.ndarray:
-            denom = 1.0 + ((kl * np.sqrt(u**2 + v**2)) / max(n, 1)) ** 2
-            return (kl / max(n, 1)) ** 2 * denom ** (-1.5)
+            order = max(n, 1)
+            rho = corr_len / order
+            denom = 1.0 + (rho**2) * (u**2 + v**2)
+            return (rho**2) * denom ** (-1.5)
 
     return provider
 
@@ -231,7 +289,7 @@ def _assemble_integrands(
     wn_provider: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
     Nmax: int,
     pol: str,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[Dict[str, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
     propagators = _build_propagators(U, V, q1, q2, k, er, geom_data, pol)
 
     K1 = _build_gkc1(U, V, geom_data, q1, surf, wn_provider, Nmax)
@@ -240,12 +298,6 @@ def _assemble_integrands(
 
     C1 = _build_gc_block1(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
     C2 = _build_gc_block2(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
-
-    Int_kc = (
-        np.conjugate(propagators["Fp"]) * propagators["Fp"] * K1
-        + np.conjugate(propagators["Fm"]) * propagators["Fm"] * K2
-        + np.conjugate(propagators["Gp"]) * propagators["Gp"] * K3
-    )
 
     Int_c = np.zeros_like(U, dtype=np.complex128)
     P = propagators
@@ -265,7 +317,7 @@ def _assemble_integrands(
     Int_c += (P["Gp"] * np.conjugate(P["Fp"])) * C2["gc13"]
     Int_c += (P["Gm"] * np.conjugate(P["Fp"])) * C2["gc14"]
 
-    return Int_kc, Int_c
+    return propagators, (K1, K2, K3), Int_c
 
 def _build_propagators(
     U: np.ndarray,
@@ -280,6 +332,7 @@ def _build_propagators(
     cos_phi, sin_phi = _spectral_angles(U, V)
     C_air = _compute_C_coeffs(q1, geom_data, cos_phi, sin_phi, U, V)
     C_soil = _compute_C_coeffs(q2, geom_data, cos_phi, sin_phi, U, V)
+
     B_air = _compute_B_coeffs(q1, geom_data, cos_phi, sin_phi, U, V)
     B_soil = _compute_B_coeffs(q2, geom_data, cos_phi, sin_phi, U, V)
 
@@ -390,13 +443,21 @@ def _compute_downward_propagators(
     R = 0.5 * (Rv - Rh)
     mu_r = 1.0
     u_r = 1.0
-    inv_q1 = _safe_inverse(-q1)
-    inv_q2 = _safe_inverse(-q2)
+
+    if pol in {"hv", "vh"}:
+        q1_basis = np.abs(q1)
+        q2_basis = np.abs(q2)
+    else:
+        q1_basis = q1
+        q2_basis = q2
+
+    inv_q1 = _safe_inverse(-q1_basis)
+    inv_q2 = _safe_inverse(-q2_basis)
 
     C_air = _compute_C_coeffs(-q1, geom_data, cos_phi, sin_phi, U, V)
     C_soil = _compute_C_coeffs(-q2, geom_data, cos_phi, sin_phi, U, V)
-    B_air = _compute_B_coeffs(-q1, geom_data, cos_phi, sin_phi, U, V)
-    B_soil = _compute_B_coeffs(-q2, geom_data, cos_phi, sin_phi, U, V)
+    B_air = _compute_B_coeffs(-q1_basis, geom_data, cos_phi, sin_phi, U, V)
+    B_soil = _compute_B_coeffs(-q2_basis, geom_data, cos_phi, sin_phi, U, V)
 
     if pol == "vv":
         coeff = C_air

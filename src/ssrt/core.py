@@ -202,8 +202,6 @@ class S2RTR:
 
                 lambda_m = toLambda(self.f)
                 k = 2.0 * np.pi / lambda_m
-                kl = float(k * self.cl)
-                ks = float(k * self.s)
                 surface_map = {'gauss': 1, 'exp': 2, 'pow': 3}
                 itype = surface_map.get(self.acftype, 1)
                 phi_rel = (self.phi_s - self.phi_i) % 360
@@ -213,12 +211,14 @@ class S2RTR:
                     theta_i=self.theta_i,
                     theta_s=self.theta_s,
                     phi_s=phi_rel,
-                    kl=kl,
-                    ks=ks,
                     err=float(np.real(eps_surface)),
                     eri=float(np.imag(eps_surface)),
                     itype=itype,
-                    add_multiple=False,
+                    addMultiple=False,
+                    frequency_ghz=float(self.f),
+                    k0=k,
+                    sigma=float(self.s),
+                    corr_len=float(self.cl),
                 )
                 sig_s = {
                     'vv': toPower(vv_db),
@@ -301,8 +301,6 @@ class S2RTR:
 
                 lambda_m = toLambda(self.f)
                 k = 2.0 * np.pi / lambda_m
-                kl = float(k * self.cl)
-                ks = float(k * self.s)
                 surface_map = {'gauss': 1, 'exp': 2, 'pow': 3}
                 itype = surface_map.get(self.acftype, 1)
                 phi_rel = (self.phi_s - self.phi_i) % 360
@@ -312,12 +310,14 @@ class S2RTR:
                     theta_i=self.theta_i,
                     theta_s=self.theta_s,
                     phi_s=phi_rel,
-                    kl=kl,
-                    ks=ks,
                     err=float(np.real(eps_top)),
                     eri=float(np.imag(eps_top)),
                     itype=itype,
-                    add_multiple=False,
+                    addMultiple=False,
+                    frequency_ghz=float(self.f),
+                    k0=k,
+                    sigma=float(self.s),
+                    corr_len=float(self.cl),
                 )
                 sig_0_top = {
                     'vv': toPower(vv_top_db),
@@ -331,12 +331,14 @@ class S2RTR:
                     theta_i=self.theta_i,
                     theta_s=self.theta_s,
                     phi_s=phi_rel,
-                    kl=kl,
-                    ks=ks,
                     err=float(np.real(eps_bot)),
                     eri=float(np.imag(eps_bot)),
                     itype=itype,
-                    add_multiple=False,
+                    addMultiple=False,
+                    frequency_ghz=float(self.f),
+                    k0=k,
+                    sigma=float(self.s),
+                    corr_len=float(self.cl),
                 )
                 sig_0_bot = {
                     'vv': toPower(vv_bot_db),
