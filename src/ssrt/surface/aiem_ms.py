@@ -130,11 +130,15 @@ class _MultipleScatteringIntegrator:
         k = self.phys.k
         er = self.phys.er
 
-        q1 = np.sqrt(np.maximum(k**2 - (U**2 + V**2), 0.0))
+        # Preserve the evanescent behaviour of the spectral components by allowing
+        # complex propagation constants.  Clamping the radicand to zero collapses
+        # the imaginary branch and explodes the Fresnel prefactors for cross-pol
+        # channels near the critical angle.
+        q1 = np.sqrt((k**2 - (U**2 + V**2)) + 0.0j)
         q2 = np.sqrt(er * k**2 - (U**2 + V**2))
 
         qmin = 1e-6
-        rad = (np.real(q1) > qmin) | (np.real(q2) > qmin)
+        rad = (np.abs(q1) > qmin) | (np.abs(q2) > qmin)
         W2D = np.outer(wu, wv)
 
         results: Dict[str, float] = {pol: 0.0 for pol in self.pols}
