@@ -143,6 +143,7 @@ def _run_comparison(
             float(eps_i),
             surface_type,
             addMultiple=include_multiple,
+            frequency_ghz=frequency_ghz,
             k0=k,
             sigma=sigma,
             corr_len=corr_len,

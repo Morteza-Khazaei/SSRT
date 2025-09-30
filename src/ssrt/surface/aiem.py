@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+import math
+
 import numpy as np
 from scipy.special import gammaln, kv
 
@@ -32,6 +34,7 @@ class AIEMParameters:
     surface_type: int
     add_multiple: bool = False
     output_unit: str = "dB"
+    frequency_ghz: float | None = None
     k0: float | None = None
     sigma: float | None = None
     corr_len: float | None = None
@@ -85,28 +88,24 @@ class AIEMModel:
         self.cs2 = self.cs**2
         self.css2 = self.css**2
 
-        # Roughness parameters (dimensionless)
-        self.ks = params.ks
-        self.ks2 = params.ks**2
-        self.kl = params.kl
-        self.kl2 = params.kl**2
-
         # Physical wavenumber and dimensional roughness descriptors
-        self.k0: float = params.k0 if params.k0 is not None else 1.0
-        if params.add_multiple and params.k0 is None:
-            raise ValueError("k0 must be provided when multiple scattering is enabled")
-        if self.k0 <= 0.0:
-            raise ValueError("k0 must be positive when provided")
+        self.k0 = self._compute_wavenumber(params)
 
         if params.sigma is not None:
             self.sigma = params.sigma
         else:
-            self.sigma = self.ks / self.k0
+            self.sigma = params.ks / self.k0
 
         if params.corr_len is not None:
             self.corr_len = params.corr_len
         else:
-            self.corr_len = self.kl / self.k0
+            self.corr_len = params.kl / self.k0
+
+        # Roughness parameters (dimensionless, built from k0)
+        self.ks = self.k0 * self.sigma
+        self.ks2 = self.ks**2
+        self.kl = self.k0 * self.corr_len
+        self.kl2 = self.kl**2
 
         self._single_cache: SingleScatteringBreakdown | None = None
         self._multiple_cache: Dict[str, float] | None = None
@@ -204,6 +203,29 @@ class AIEMModel:
         )
         self._multiple_cache = contributions
         return contributions
+
+    def _compute_wavenumber(self, params: AIEMParameters) -> float:
+        """Determine the physical wavenumber from frequency or explicit input."""
+
+        if params.frequency_ghz is not None:
+            if params.frequency_ghz <= 0.0:
+                raise ValueError("frequency_ghz must be positive when provided")
+            c0 = 299_792_458.0  # speed of light (m/s)
+            lam = c0 / (params.frequency_ghz * 1e9)
+            k0 = 2.0 * math.pi / lam
+        elif params.k0 is not None:
+            k0 = params.k0
+        else:
+            k0 = 1.0
+
+        if params.add_multiple and params.frequency_ghz is None and params.k0 is None:
+            raise ValueError(
+                "frequency_ghz or k0 must be provided when multiple scattering is enabled"
+            )
+        if k0 <= 0.0:
+            raise ValueError("k0 must be positive")
+
+        return k0
 
     def set_propagation_branch(self, z: float, zp: float) -> str:
         """Eq. (5): Return propagation branch '+' (upward) or '-' (downward)."""
@@ -1006,6 +1028,7 @@ def AIEM(
     addMultiple: bool = False,
     output_unit: str = "dB",
     *,
+    frequency_ghz: float | None = None,
     k0: float | None = None,
     sigma: float | None = None,
     corr_len: float | None = None,
@@ -1023,6 +1046,7 @@ def AIEM(
         surface_type=itype,
         add_multiple=addMultiple,
         output_unit=output_unit,
+        frequency_ghz=frequency_ghz,
         k0=k0,
         sigma=sigma,
         corr_len=corr_len,
