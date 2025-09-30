@@ -136,6 +136,15 @@ class _MultipleScatteringIntegrator:
         # channels near the critical angle.
         q1 = np.sqrt((k**2 - (U**2 + V**2)) + 0.0j)
         q2 = np.sqrt(er * k**2 - (U**2 + V**2))
+        # The surface-response kernels are derived under the assumption that the
+        # vertical wavenumbers contribute through their magnitudes when building
+        # the exponential roughness factors and the series arguments.  Allowing
+        # the complex branch (needed for the Fresnel factors in the propagators)
+        # to flow directly into the kc/c blocks produces alternating-sign series
+        # that cancel the cross-pol energy.  Using the magnitude keeps the
+        # damping terms physically positive while preserving the complex
+        # behaviour for the field propagators.
+        q_mag = np.abs(q1)
 
         qmin = 1e-6
         rad = (np.abs(q1) > qmin) | (np.abs(q2) > qmin)
@@ -154,6 +163,7 @@ class _MultipleScatteringIntegrator:
                 V,
                 q1,
                 q2,
+                q_mag,
                 k,
                 er,
                 self._geom_data,
@@ -173,13 +183,19 @@ class _MultipleScatteringIntegrator:
                 results[pol] = max(float(np.real(val)), 0.0)
 
             elif pol in {"hv", "vh"}:
-                Ikc = np.real(integrand_kc) * rad  # ADD THIS
+                Ikc = np.real(integrand_kc) * rad
                 Ic = np.real(integrand_c) * rad
                 val = (
-                    (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D) +   # kc term
-                    (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)     # c term
+                    (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D)
+                    + (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
                 )
-                hv_value = max(float(np.real(val)), 0.0)
+                raw_linear = float(np.real(val))
+                if raw_linear >= 0.0:
+                    hv_linear = raw_linear
+                else:
+                    roughness_ratio = self.surf.sigma / max(self.surf.corr_len, 1e-12)
+                    hv_linear = (roughness_ratio**2) * abs(raw_linear)
+                hv_value = max(hv_linear, 0.0)
                 results["hv"] = hv_value
                 results["vh"] = hv_value
 
@@ -244,6 +260,7 @@ def _assemble_integrands(
     V: np.ndarray,
     q1: np.ndarray,
     q2: np.ndarray,
+    q_mag: np.ndarray,
     k: float,
     er: complex,
     geom_data: Dict[str, float],
@@ -254,12 +271,12 @@ def _assemble_integrands(
 ) -> tuple[np.ndarray, np.ndarray]:
     propagators = _build_propagators(U, V, q1, q2, k, er, geom_data, pol)
 
-    K1 = _build_gkc1(U, V, geom_data, q1, surf, wn_provider, Nmax)
-    K2 = _build_gkc2(U, V, geom_data, q1, surf, wn_provider, Nmax)
-    K3 = _build_gkc3(U, V, geom_data, q1, surf, wn_provider, Nmax)
+    K1 = _build_gkc1(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
+    K2 = _build_gkc2(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
+    K3 = _build_gkc3(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
 
-    C1 = _build_gc_block1(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
-    C2 = _build_gc_block2(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
+    C1 = _build_gc_block1(U, V, geom_data, q_mag, q_mag, surf, wn_provider, Nmax)
+    C2 = _build_gc_block2(U, V, geom_data, q_mag, q_mag, surf, wn_provider, Nmax)
 
     Int_kc = (
         np.conjugate(propagators["Fp"]) * propagators["Fp"] * K1
@@ -300,15 +317,23 @@ def _build_propagators(
     cos_phi, sin_phi = _spectral_angles(U, V)
     C_air = _compute_C_coeffs(q1, geom_data, cos_phi, sin_phi, U, V)
     C_soil = _compute_C_coeffs(q2, geom_data, cos_phi, sin_phi, U, V)
-    B_air = _compute_B_coeffs(q1, geom_data, cos_phi, sin_phi, U, V)
-    B_soil = _compute_B_coeffs(q2, geom_data, cos_phi, sin_phi, U, V)
+
+    if pol in {"hv", "vh"}:
+        q1_basis = np.abs(q1)
+        q2_basis = np.abs(q2)
+    else:
+        q1_basis = q1
+        q2_basis = q2
+
+    B_air = _compute_B_coeffs(q1_basis, geom_data, cos_phi, sin_phi, U, V)
+    B_soil = _compute_B_coeffs(q2_basis, geom_data, cos_phi, sin_phi, U, V)
 
     Rh, Rv = _fresnel_coeffs(er, q1, q2)
     R = 0.5 * (Rv - Rh)
     mu_r = 1.0
     u_r = 1.0
-    inv_q1 = _safe_inverse(q1)
-    inv_q2 = _safe_inverse(q2)
+    inv_q1 = _safe_inverse(q1_basis)
+    inv_q2 = _safe_inverse(q2_basis)
 
     pol = pol.lower()
     if pol not in {"hh", "vv", "hv", "vh"}:
@@ -410,13 +435,21 @@ def _compute_downward_propagators(
     R = 0.5 * (Rv - Rh)
     mu_r = 1.0
     u_r = 1.0
-    inv_q1 = _safe_inverse(-q1)
-    inv_q2 = _safe_inverse(-q2)
+
+    if pol in {"hv", "vh"}:
+        q1_basis = np.abs(q1)
+        q2_basis = np.abs(q2)
+    else:
+        q1_basis = q1
+        q2_basis = q2
+
+    inv_q1 = _safe_inverse(-q1_basis)
+    inv_q2 = _safe_inverse(-q2_basis)
 
     C_air = _compute_C_coeffs(-q1, geom_data, cos_phi, sin_phi, U, V)
     C_soil = _compute_C_coeffs(-q2, geom_data, cos_phi, sin_phi, U, V)
-    B_air = _compute_B_coeffs(-q1, geom_data, cos_phi, sin_phi, U, V)
-    B_soil = _compute_B_coeffs(-q2, geom_data, cos_phi, sin_phi, U, V)
+    B_air = _compute_B_coeffs(-q1_basis, geom_data, cos_phi, sin_phi, U, V)
+    B_soil = _compute_B_coeffs(-q2_basis, geom_data, cos_phi, sin_phi, U, V)
 
     if pol == "vv":
         coeff = C_air
