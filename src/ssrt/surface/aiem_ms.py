@@ -156,8 +156,6 @@ class _MultipleScatteringIntegrator:
         # that cancel the cross-pol energy.  Using the magnitude keeps the
         # damping terms physically positive while preserving the complex
         # behaviour for the field propagators.
-        q_mag = np.abs(q1)
-
         qmin = 1e-6
         rad = (np.abs(q1) > qmin) | (np.abs(q2) > qmin)
         W2D = np.outer(wu, wv)
@@ -179,7 +177,6 @@ class _MultipleScatteringIntegrator:
                 V,
                 q1,
                 q2,
-                q_mag,
                 k,
                 er,
                 self._geom_data,
@@ -280,7 +277,6 @@ def _assemble_integrands(
     V: np.ndarray,
     q1: np.ndarray,
     q2: np.ndarray,
-    q_mag: np.ndarray,
     k: float,
     er: complex,
     geom_data: Dict[str, float],
@@ -291,12 +287,12 @@ def _assemble_integrands(
 ) -> tuple[Dict[str, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
     propagators = _build_propagators(U, V, q1, q2, k, er, geom_data, pol)
 
-    K1 = _build_gkc1(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
-    K2 = _build_gkc2(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
-    K3 = _build_gkc3(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
+    K1 = _build_gkc1(U, V, geom_data, q1, surf, wn_provider, Nmax)
+    K2 = _build_gkc2(U, V, geom_data, q1, surf, wn_provider, Nmax)
+    K3 = _build_gkc3(U, V, geom_data, q1, surf, wn_provider, Nmax)
 
-    C1 = _build_gc_block1(U, V, geom_data, q_mag, q_mag, surf, wn_provider, Nmax)
-    C2 = _build_gc_block2(U, V, geom_data, q_mag, q_mag, surf, wn_provider, Nmax)
+    C1 = _build_gc_block1(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
+    C2 = _build_gc_block2(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
 
     Int_c = np.zeros_like(U, dtype=np.complex128)
     P = propagators
@@ -332,22 +328,15 @@ def _build_propagators(
     C_air = _compute_C_coeffs(q1, geom_data, cos_phi, sin_phi, U, V)
     C_soil = _compute_C_coeffs(q2, geom_data, cos_phi, sin_phi, U, V)
 
-    if pol in {"hv", "vh"}:
-        q1_basis = np.abs(q1)
-        q2_basis = np.abs(q2)
-    else:
-        q1_basis = q1
-        q2_basis = q2
-
-    B_air = _compute_B_coeffs(q1_basis, geom_data, cos_phi, sin_phi, U, V)
-    B_soil = _compute_B_coeffs(q2_basis, geom_data, cos_phi, sin_phi, U, V)
+    B_air = _compute_B_coeffs(q1, geom_data, cos_phi, sin_phi, U, V)
+    B_soil = _compute_B_coeffs(q2, geom_data, cos_phi, sin_phi, U, V)
 
     Rh, Rv = _fresnel_coeffs(er, q1, q2)
     R = 0.5 * (Rv - Rh)
     mu_r = 1.0
     u_r = 1.0
-    inv_q1 = _safe_inverse(q1_basis)
-    inv_q2 = _safe_inverse(q2_basis)
+    inv_q1 = _safe_inverse(q1)
+    inv_q2 = _safe_inverse(q2)
 
     pol = pol.lower()
     if pol not in {"hh", "vv", "hv", "vh"}:

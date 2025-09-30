@@ -12,12 +12,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+import logging
 import math
+import time
 
 import numpy as np
 from scipy.special import gammaln, kv
 
 from .aiem_ms import compute_multiple_scattering
+
+
+logger = logging.getLogger(__name__)
+
+C0 = 299_792_458.0  # speed of light in vacuum (m/s)
 
 
 @dataclass(frozen=True)
@@ -192,6 +199,28 @@ class AIEMModel:
         assert self._kirchhoff_cache is not None
         kirchhoff_fields = self._kirchhoff_cache["fields"]
 
+        freq_ghz = self.params.frequency_ghz
+        if freq_ghz is None:
+            freq_ghz = (self.k0 * C0) / (2.0 * math.pi * 1e9)
+
+        n_points = 65
+        nmax = 8
+        start = time.perf_counter()
+        logger.info(
+            (
+                "AIEM multiple scattering start: freq=%.3f GHz, theta_i=%.2f°, "
+                "sigma=%.4f m, corr_len=%.4f m, surface=%s, grid=%dx%d, Nmax=%d"
+            ),
+            freq_ghz,
+            math.degrees(self.theta_i),
+            self.sigma,
+            self.corr_len,
+            surface_label,
+            n_points,
+            n_points,
+            nmax,
+        )
+
         contributions, components = compute_multiple_scattering(
             theta_i=self.theta_i,
             theta_s=self.theta_s,
@@ -204,6 +233,14 @@ class AIEMModel:
             surface_label=surface_label,
             polarisations=pols,
             kirchhoff_fields=kirchhoff_fields,
+            n_points=n_points,
+            nmax=nmax,
+        )
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "AIEM multiple scattering complete in %.2f s (%.3f s per polarisation)",
+            elapsed,
+            elapsed / max(len(pols), 1),
         )
         self._multiple_cache = contributions
         self._multiple_components_cache = components
@@ -226,8 +263,7 @@ class AIEMModel:
         if params.frequency_ghz is not None:
             if params.frequency_ghz <= 0.0:
                 raise ValueError("frequency_ghz must be positive when provided")
-            c0 = 299_792_458.0  # speed of light (m/s)
-            lam = c0 / (params.frequency_ghz * 1e9)
+            lam = C0 / (params.frequency_ghz * 1e9)
             k0 = 2.0 * math.pi / lam
         elif params.k0 is not None:
             k0 = params.k0

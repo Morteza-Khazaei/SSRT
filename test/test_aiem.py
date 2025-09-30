@@ -21,7 +21,9 @@ filtering.
 from __future__ import annotations
 
 import argparse
+import logging
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Set
@@ -30,6 +32,8 @@ import numpy as np
 
 from ssrt.surface.aiem import AIEMModel, AIEMParameters
 from ssrt.utils.util import toLambda
+
+logger = logging.getLogger(__name__)
 
 # Default configuration mirrors the notebook
 _DEFAULT_LUT = Path("data/NMM3D_LUT_NRCS_40degree.dat")
@@ -394,6 +398,29 @@ def _run_comparison(
     lam = toLambda(frequency_ghz)
     k = 2.0 * math.pi / lam
 
+    selected_rows: List[np.ndarray] = []
+    for row in rows:
+        ratio_value = float(row[1])
+        if ratios and not _isclose(ratio_value, ratios):
+            continue
+        selected_rows.append(row)
+
+    ratio_summary = "all" if not ratios else ",".join(str(r) for r in ratios)
+    logger.info(
+        (
+            "AIEM comparison start: cases=%d, freq=%.3f GHz, incidence=%.1f°, "
+            "phi=%.1f°, surface_type=%d, ratios=%s, multiple=%s"
+        ),
+        len(selected_rows),
+        frequency_ghz,
+        incidence_deg,
+        phi_deg,
+        surface_type,
+        ratio_summary,
+        include_multiple,
+    )
+    start_time = time.perf_counter()
+
     overall_model: Dict[str, List[float]] = {pol: [] for pol in ("hh", "vv", "hv")}
     overall_reference: Dict[str, List[float]] = {pol: [] for pol in ("hh", "vv", "hv")}
     grouped_model: Dict[float, Dict[str, List[float]]] = {}
@@ -402,7 +429,9 @@ def _run_comparison(
     component_entries: List[CrossPolComponentEntry] = []
     component_entries_by_ratio: Dict[float, List[CrossPolComponentEntry]] = {}
 
-    for row in rows:
+    processed = 0
+
+    for row in selected_rows:
         (
             _theta,
             ratio,
@@ -483,6 +512,8 @@ def _run_comparison(
             component_entries.append(entry)
             component_entries_by_ratio.setdefault(ratio, []).append(entry)
 
+        processed += 1
+
     overall_metrics = {
         pol: _calc_metrics(overall_model[pol], overall_reference[pol]) for pol in overall_model
     }
@@ -503,6 +534,15 @@ def _run_comparison(
                 for ratio_value, entries in component_entries_by_ratio.items()
             },
         )
+
+    elapsed = time.perf_counter() - start_time
+    per_case = elapsed / processed if processed else 0.0
+    logger.info(
+        "AIEM comparison complete: processed=%d in %.2f s (%.3f s/case)",
+        processed,
+        elapsed,
+        per_case,
+    )
 
     return ComparisonResult(overall=overall_metrics, by_ratio=by_ratio, cross_pol=diagnostics)
 
@@ -693,6 +733,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
