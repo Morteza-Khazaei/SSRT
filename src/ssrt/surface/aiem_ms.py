@@ -36,6 +36,8 @@ class Surface:
     ks: float
     kl: float
     k: float
+    sigma: float
+    corr_len: float
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,9 @@ def compute_multiple_scattering(
     er: complex,
     ks: float,
     kl: float,
+    k0: float,
+    sigma: float,
+    corr_len: float,
     surface_label: str,
     polarisations: Sequence[str] = ("hh", "vv", "hv", "vh"),
     n_points: int = 129,
@@ -63,8 +68,15 @@ def compute_multiple_scattering(
     """Evaluate multiple-scattering contributions for the requested polarisations."""
 
     geom = Geometry(theta_i=theta_i, theta_s=theta_s, phi_i=phi_i, phi_s=phi_s)
-    phys = Physics(k=1.0, er=er)
-    surf = Surface(type=surface_label.lower(), ks=ks, kl=kl, k=phys.k)
+    phys = Physics(k=k0, er=er)
+    surf = Surface(
+        type=surface_label.lower(),
+        ks=ks,
+        kl=kl,
+        k=phys.k,
+        sigma=sigma,
+        corr_len=corr_len,
+    )
     quad = _build_quadrature(surf, n_points=n_points, nmax=nmax)
 
     integrator = _MultipleScatteringIntegrator(geom, phys, surf, quad, polarisations)
@@ -72,7 +84,8 @@ def compute_multiple_scattering(
 
 
 def _build_quadrature(surf: Surface, n_points: int, nmax: int) -> Quadrature:
-    umax = 5.0 / max(surf.kl, 1e-6)
+    corr = max(surf.corr_len, 1e-6)
+    umax = 5.0 / corr
     grid = np.linspace(-umax, umax, n_points, dtype=float)
     U, V = np.meshgrid(grid, grid, indexing="ij")
 
@@ -204,17 +217,20 @@ def _prepare_geometry_terms(geom: Geometry, phys: Physics) -> Dict[str, float]:
 
 def _make_Wn_provider(surf: Surface) -> Callable[[np.ndarray, np.ndarray, int], np.ndarray]:
     sigma2 = (surf.ks / surf.k) ** 2
-    kl = surf.kl
+    corr_len = surf.corr_len
 
     if surf.type == "gauss":
         def provider(u: np.ndarray, v: np.ndarray, n: int) -> np.ndarray:
-            factor = kl**2 / max(n, 1)
-            exp_arg = -(kl**2 / (4.0 * max(n, 1))) * (u**2 + v**2)
+            order = max(n, 1)
+            factor = corr_len**2 / order
+            exp_arg = -(corr_len**2 / (4.0 * order)) * (u**2 + v**2)
             return (factor / (4.0 * np.pi)) * np.exp(exp_arg)
     else:
         def provider(u: np.ndarray, v: np.ndarray, n: int) -> np.ndarray:
-            denom = 1.0 + ((kl * np.sqrt(u**2 + v**2)) / max(n, 1)) ** 2
-            return (kl / max(n, 1)) ** 2 * denom ** (-1.5)
+            order = max(n, 1)
+            rho = corr_len / order
+            denom = 1.0 + (rho**2) * (u**2 + v**2)
+            return (rho**2) * denom ** (-1.5)
 
     return provider
 

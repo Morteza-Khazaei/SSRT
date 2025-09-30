@@ -143,6 +143,9 @@ def _run_comparison(
             float(eps_i),
             surface_type,
             addMultiple=include_multiple,
+            k0=k,
+            sigma=sigma,
+            corr_len=corr_len,
         )
 
         overall_model["hh"].append(hh_db)

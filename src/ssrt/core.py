@@ -219,6 +219,9 @@ class S2RTR:
                     eri=float(np.imag(eps_surface)),
                     itype=itype,
                     add_multiple=False,
+                    k0=k,
+                    sigma=float(self.s),
+                    corr_len=float(self.cl),
                 )
                 sig_s = {
                     'vv': toPower(vv_db),
@@ -318,6 +321,9 @@ class S2RTR:
                     eri=float(np.imag(eps_top)),
                     itype=itype,
                     add_multiple=False,
+                    k0=k,
+                    sigma=float(self.s),
+                    corr_len=float(self.cl),
                 )
                 sig_0_top = {
                     'vv': toPower(vv_top_db),
@@ -337,6 +343,9 @@ class S2RTR:
                     eri=float(np.imag(eps_bot)),
                     itype=itype,
                     add_multiple=False,
+                    k0=k,
+                    sigma=float(self.s),
+                    corr_len=float(self.cl),
                 )
                 sig_0_bot = {
                     'vv': toPower(vv_bot_db),

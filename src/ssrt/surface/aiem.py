@@ -32,6 +32,9 @@ class AIEMParameters:
     surface_type: int
     add_multiple: bool = False
     output_unit: str = "dB"
+    k0: float | None = None
+    sigma: float | None = None
+    corr_len: float | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,23 @@ class AIEMModel:
         self.ks2 = params.ks**2
         self.kl = params.kl
         self.kl2 = params.kl**2
+
+        # Physical wavenumber and dimensional roughness descriptors
+        self.k0: float = params.k0 if params.k0 is not None else 1.0
+        if params.add_multiple and params.k0 is None:
+            raise ValueError("k0 must be provided when multiple scattering is enabled")
+        if self.k0 <= 0.0:
+            raise ValueError("k0 must be positive when provided")
+
+        if params.sigma is not None:
+            self.sigma = params.sigma
+        else:
+            self.sigma = self.ks / self.k0
+
+        if params.corr_len is not None:
+            self.corr_len = params.corr_len
+        else:
+            self.corr_len = self.kl / self.k0
 
         self._single_cache: SingleScatteringBreakdown | None = None
         self._multiple_cache: Dict[str, float] | None = None
@@ -176,6 +196,9 @@ class AIEMModel:
             er=self.er,
             ks=self.ks,
             kl=self.kl,
+            k0=self.k0,
+            sigma=self.sigma,
+            corr_len=self.corr_len,
             surface_label=surface_label,
             polarisations=pols,
         )
@@ -982,6 +1005,10 @@ def AIEM(
     itype: int,
     addMultiple: bool = False,
     output_unit: str = "dB",
+    *,
+    k0: float | None = None,
+    sigma: float | None = None,
+    corr_len: float | None = None,
 ) -> Tuple[float, float, float, float]:
     """Convenience wrapper matching the historical MATLAB signature."""
 
@@ -996,6 +1023,9 @@ def AIEM(
         surface_type=itype,
         add_multiple=addMultiple,
         output_unit=output_unit,
+        k0=k0,
+        sigma=sigma,
+        corr_len=corr_len,
     )
     result = AIEMModel(params).compute()
     return result.hh, result.vv, result.hv, result.vh
