@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Sequence
+from typing import Callable, Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -60,7 +60,8 @@ def compute_multiple_scattering(
     corr_len: float,
     surface_label: str,
     polarisations: Sequence[str] = ("hh", "vv", "hv", "vh"),
-    n_points: int = 129,
+    kirchhoff_fields: Mapping[str, complex] | None = None,
+    n_points: int = 65,
     nmax: int = 8,
 ) -> tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
     """Evaluate multiple-scattering contributions for the requested polarisations."""
@@ -79,7 +80,14 @@ def compute_multiple_scattering(
     )
     quad = _build_quadrature(surf, n_points=n_points, nmax=nmax)
 
-    integrator = _MultipleScatteringIntegrator(geom, phys, surf, quad, polarisations)
+    integrator = _MultipleScatteringIntegrator(
+        geom,
+        phys,
+        surf,
+        quad,
+        polarisations,
+        kirchhoff_fields or {},
+    )
     return integrator.compute()
 
 
@@ -113,12 +121,16 @@ class _MultipleScatteringIntegrator:
         surf: Surface,
         quad: Quadrature,
         polarisations: Sequence[str],
+        kirchhoff_fields: Mapping[str, complex],
     ) -> None:
         self.geom = geom
         self.phys = phys
         self.surf = surf
         self.quad = quad
         self.pols = tuple(p.lower() for p in polarisations)
+        self.fields = {
+            pol.lower(): kirchhoff_fields.get(pol.lower(), 0.0) for pol in self.pols
+        }
         self._wn = _make_Wn_provider(surf)
         self._geom_data = _prepare_geometry_terms(geom, phys)
 
@@ -162,7 +174,7 @@ class _MultipleScatteringIntegrator:
                 components[pol] = components.get("hv", {"kc": 0.0, "c": 0.0}).copy()
                 continue
 
-            integrand_kc, integrand_c = _assemble_integrands(
+            propagators, kernels, integrand_c = _assemble_integrands(
                 U,
                 V,
                 q1,
@@ -177,9 +189,16 @@ class _MultipleScatteringIntegrator:
                 pol,
             )
 
-            Ikc = np.real(integrand_kc) * rad
+            field = self.fields.get(pol, 0.0)
+            K1, K2, K3 = kernels
+            kc_integrand = (
+                propagators["Fp"] * K1
+                + propagators["Fm"] * K2
+                + propagators["Gp"] * K3
+            )
+            kc_sum = np.sum(kc_integrand * rad * W2D)
+            kc_term = (k**2 / (8.0 * np.pi)) * np.real(np.conjugate(field) * kc_sum)
             Ic = np.real(integrand_c) * rad
-            kc_term = (k**2 / (8.0 * np.pi)) * np.sum(Ikc * W2D)
             c_term = (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
 
             kc_linear = float(np.real(kc_term))
@@ -269,7 +288,7 @@ def _assemble_integrands(
     wn_provider: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
     Nmax: int,
     pol: str,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[Dict[str, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
     propagators = _build_propagators(U, V, q1, q2, k, er, geom_data, pol)
 
     K1 = _build_gkc1(U, V, geom_data, q_mag, surf, wn_provider, Nmax)
@@ -278,12 +297,6 @@ def _assemble_integrands(
 
     C1 = _build_gc_block1(U, V, geom_data, q_mag, q_mag, surf, wn_provider, Nmax)
     C2 = _build_gc_block2(U, V, geom_data, q_mag, q_mag, surf, wn_provider, Nmax)
-
-    Int_kc = (
-        np.conjugate(propagators["Fp"]) * propagators["Fp"] * K1
-        + np.conjugate(propagators["Fm"]) * propagators["Fm"] * K2
-        + np.conjugate(propagators["Gp"]) * propagators["Gp"] * K3
-    )
 
     Int_c = np.zeros_like(U, dtype=np.complex128)
     P = propagators
@@ -303,7 +316,7 @@ def _assemble_integrands(
     Int_c += (P["Gp"] * np.conjugate(P["Fp"])) * C2["gc13"]
     Int_c += (P["Gm"] * np.conjugate(P["Fp"])) * C2["gc14"]
 
-    return Int_kc, Int_c
+    return propagators, (K1, K2, K3), Int_c
 
 def _build_propagators(
     U: np.ndarray,

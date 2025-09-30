@@ -185,6 +185,13 @@ class AIEMModel:
 
         surface_label = "gauss" if self.params.surface_type == 1 else "exp"
         pols = ("hh", "vv", "hv", "vh")
+        if self._kirchhoff_cache is None:
+            # Ensure Kirchhoff fields are available for the kc cross term
+            self.sigma0_single()
+
+        assert self._kirchhoff_cache is not None
+        kirchhoff_fields = self._kirchhoff_cache["fields"]
+
         contributions, components = compute_multiple_scattering(
             theta_i=self.theta_i,
             theta_s=self.theta_s,
@@ -196,6 +203,7 @@ class AIEMModel:
             corr_len=self.corr_len,
             surface_label=surface_label,
             polarisations=pols,
+            kirchhoff_fields=kirchhoff_fields,
         )
         self._multiple_cache = contributions
         self._multiple_components_cache = components
