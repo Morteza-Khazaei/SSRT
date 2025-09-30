@@ -198,8 +198,8 @@ class _MultipleScatteringIntegrator:
             )
             kc_sum = np.sum(kc_integrand * rad * W2D)
             kc_term = (k**2 / (8.0 * np.pi)) * np.real(np.conjugate(field) * kc_sum)
-            Ic = np.real(integrand_c) * rad
-            c_term = (k**2 / (64.0 * np.pi)) * np.sum(Ic * W2D)
+            c_sum = np.sum(integrand_c * rad * W2D)
+            c_term = (k**2 / (64.0 * np.pi)) * np.real(c_sum)
 
             kc_linear = float(np.real(kc_term))
             c_linear = float(np.real(c_term))
