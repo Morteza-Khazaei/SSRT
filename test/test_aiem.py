@@ -130,18 +130,15 @@ def _run_comparison(
 
         sigma = rms_norm * lam
         corr_len = ratio * sigma
-        ks = k * sigma
-        kl = k * corr_len
-
         hh_db, vv_db, hv_db, _ = AIEM(
-            incidence_deg,
-            incidence_deg,
-            phi_deg,
-            kl,
-            ks,
-            float(eps_r),
-            float(eps_i),
-            surface_type,
+            theta_i=incidence_deg,
+            theta_s=incidence_deg,
+            phi_s=phi_deg,
+            kl=None,
+            ks=None,
+            err=float(eps_r),
+            eri=float(eps_i),
+            itype=surface_type,
             addMultiple=include_multiple,
             frequency_ghz=frequency_ghz,
             k0=k,

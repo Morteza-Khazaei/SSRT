@@ -27,17 +27,23 @@ class AIEMParameters:
     theta_i: float
     theta_s: float
     phi_s: float
-    kl: float
-    ks: float
     err: float
     eri: float
     surface_type: int
+    kl: float | None = None
+    ks: float | None = None
     add_multiple: bool = False
     output_unit: str = "dB"
     frequency_ghz: float | None = None
     k0: float | None = None
     sigma: float | None = None
     corr_len: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.ks is None and self.sigma is None:
+            raise ValueError("Either ks or sigma must be provided")
+        if self.kl is None and self.corr_len is None:
+            raise ValueError("Either kl or corr_len must be provided")
 
 
 @dataclass(frozen=True)
@@ -94,11 +100,13 @@ class AIEMModel:
         if params.sigma is not None:
             self.sigma = params.sigma
         else:
+            assert params.ks is not None  # ensured by AIEMParameters.__post_init__
             self.sigma = params.ks / self.k0
 
         if params.corr_len is not None:
             self.corr_len = params.corr_len
         else:
+            assert params.kl is not None
             self.corr_len = params.kl / self.k0
 
         # Roughness parameters (dimensionless, built from k0)
@@ -193,8 +201,6 @@ class AIEMModel:
             phi_i=self.phi_i,
             phi_s=self.phi_s,
             er=self.er,
-            ks=self.ks,
-            kl=self.kl,
             k0=self.k0,
             sigma=self.sigma,
             corr_len=self.corr_len,
@@ -1020,8 +1026,8 @@ def AIEM(
     theta_i: float,
     theta_s: float,
     phi_s: float,
-    kl: float,
-    ks: float,
+    kl: float | None,
+    ks: float | None,
     err: float,
     eri: float,
     itype: int,
@@ -1033,7 +1039,14 @@ def AIEM(
     sigma: float | None = None,
     corr_len: float | None = None,
 ) -> Tuple[float, float, float, float]:
-    """Convenience wrapper matching the historical MATLAB signature."""
+    """Convenience wrapper matching the historical MATLAB signature.
+
+    The legacy interface supplied the dimensionless roughness terms ``kl`` and
+    ``ks`` directly.  When using the new ``frequency_ghz``/``k0`` inputs together
+    with dimensional roughness descriptors (``sigma`` in metres, ``corr_len`` in
+    metres), pass ``None`` for ``kl`` and ``ks`` and they will be rebuilt from
+    the physical wavenumber inside the solver.
+    """
 
     params = AIEMParameters(
         theta_i=theta_i,

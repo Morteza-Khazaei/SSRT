@@ -55,8 +55,6 @@ def compute_multiple_scattering(
     phi_i: float,
     phi_s: float,
     er: complex,
-    ks: float,
-    kl: float,
     k0: float,
     sigma: float,
     corr_len: float,
@@ -69,6 +67,8 @@ def compute_multiple_scattering(
 
     geom = Geometry(theta_i=theta_i, theta_s=theta_s, phi_i=phi_i, phi_s=phi_s)
     phys = Physics(k=k0, er=er)
+    ks = k0 * sigma
+    kl = k0 * corr_len
     surf = Surface(
         type=surface_label.lower(),
         ks=ks,
