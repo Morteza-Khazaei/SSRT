@@ -31,6 +31,8 @@ from typing import Dict, Iterable, List, Sequence, Set
 import numpy as np
 
 from ssrt.surface.aiem import AIEMModel, AIEMParameters
+from ssrt.surface.i2em import I2EM_Bistat_model
+from ssrt.surface.spm import SPM3D
 from ssrt.utils.util import toLambda
 
 logger = logging.getLogger(__name__)
@@ -112,6 +114,85 @@ class CrossPolComponentStats:
 class CrossPolDiagnostics:
     overall: CrossPolComponentStats
     by_ratio: Dict[float, CrossPolComponentStats]
+
+
+@dataclass
+class CrossModelEntry:
+    ratio: float
+    hv_aiem_single: float
+    hv_aiem_multiple: float
+    hv_aiem_total: float
+    hv_i2em: float | None
+    hv_spm: float | None
+
+
+@dataclass
+class SignedStatistic:
+    mean_linear: float
+    db: float
+    sign: int
+
+    @classmethod
+    def from_values(cls, values: Sequence[float]) -> "SignedStatistic":
+        if not values:
+            return cls(float("nan"), float("nan"), 0)
+        mean_linear = float(sum(values) / len(values))
+        magnitude = abs(mean_linear)
+        eps = 1e-30
+        db = 10.0 * math.log10(magnitude + eps)
+        if mean_linear > 0.0:
+            sign = 1
+        elif mean_linear < 0.0:
+            sign = -1
+        else:
+            sign = 0
+        return cls(mean_linear=mean_linear, db=db, sign=sign)
+
+    def format_db(self) -> str:  # pragma: no cover - presentation helper
+        if not math.isfinite(self.db):
+            return "   n/a "
+        display_db = self.db
+        if self.sign < 0:
+            display_db = -abs(self.db)
+        return f"{display_db:+6.2f} dB"
+
+
+@dataclass
+class CrossModelStats:
+    count: int
+    aiem_single: SignedStatistic
+    aiem_multiple: SignedStatistic
+    aiem_total: SignedStatistic
+    i2em: SignedStatistic | None
+    spm: SignedStatistic | None
+    aiem_minus_i2em_db: float | None
+    aiem_minus_spm_db: float | None
+
+    def format_row(self, label: str) -> str:  # pragma: no cover - presentation helper
+        def _format_optional(stat: SignedStatistic | None) -> str:
+            return stat.format_db() if stat is not None else "   n/a "
+
+        def _format_diff(value: float | None) -> str:
+            if value is None or not math.isfinite(value):
+                return "   n/a"
+            return f"{value:+6.2f} dB"
+
+        return (
+            f"{label:<8s} n={self.count:3d}  "
+            f"AIEM(s)={self.aiem_single.format_db():>8s}  "
+            f"AIEM(m)={self.aiem_multiple.format_db():>8s}  "
+            f"AIEM(t)={self.aiem_total.format_db():>8s}  "
+            f"I2EM={_format_optional(self.i2em):>8s}  "
+            f"SPM={_format_optional(self.spm):>8s}  "
+            f"Δ(I2EM)={_format_diff(self.aiem_minus_i2em_db):>8s}  "
+            f"Δ(SPM)={_format_diff(self.aiem_minus_spm_db):>8s}"
+        )
+
+
+@dataclass
+class CrossModelDiagnostics:
+    overall: CrossModelStats
+    by_ratio: Dict[float, CrossModelStats]
 
 
 @dataclass(frozen=True)
@@ -378,11 +459,91 @@ def _aggregate_component_entries(
     )
 
 
+def _aggregate_cross_model_entries(
+    entries: Iterable[CrossModelEntry],
+) -> CrossModelStats:
+    entry_list = list(entries)
+    if not entry_list:
+        empty = SignedStatistic.from_values(())
+        return CrossModelStats(
+            count=0,
+            aiem_single=empty,
+            aiem_multiple=empty,
+            aiem_total=empty,
+            i2em=None,
+            spm=None,
+            aiem_minus_i2em_db=None,
+            aiem_minus_spm_db=None,
+        )
+
+    count = len(entry_list)
+    aiem_single = SignedStatistic.from_values([e.hv_aiem_single for e in entry_list])
+    aiem_multiple = SignedStatistic.from_values([e.hv_aiem_multiple for e in entry_list])
+    aiem_total = SignedStatistic.from_values([e.hv_aiem_total for e in entry_list])
+
+    i2em_values = [e.hv_i2em for e in entry_list if e.hv_i2em is not None]
+    spm_values = [e.hv_spm for e in entry_list if e.hv_spm is not None]
+
+    i2em_stat = (
+        SignedStatistic.from_values(i2em_values)
+        if i2em_values
+        else None
+    )
+    spm_stat = (
+        SignedStatistic.from_values(spm_values)
+        if spm_values
+        else None
+    )
+
+    eps = 1e-30
+    diff_i2em = [
+        10.0 * math.log10(e.hv_aiem_total + eps)
+        - 10.0 * math.log10(e.hv_i2em + eps)
+        for e in entry_list
+        if e.hv_i2em is not None and e.hv_i2em > 0.0
+    ]
+    diff_spm = [
+        10.0 * math.log10(e.hv_aiem_total + eps)
+        - 10.0 * math.log10(e.hv_spm + eps)
+        for e in entry_list
+        if e.hv_spm is not None and e.hv_spm > 0.0
+    ]
+
+    mean_diff_i2em = (
+        float(sum(diff_i2em) / len(diff_i2em)) if diff_i2em else None
+    )
+    mean_diff_spm = (
+        float(sum(diff_spm) / len(diff_spm)) if diff_spm else None
+    )
+
+    return CrossModelStats(
+        count=count,
+        aiem_single=aiem_single,
+        aiem_multiple=aiem_multiple,
+        aiem_total=aiem_total,
+        i2em=i2em_stat,
+        spm=spm_stat,
+        aiem_minus_i2em_db=mean_diff_i2em,
+        aiem_minus_spm_db=mean_diff_spm,
+    )
+
+
 @dataclass
 class ComparisonResult:
     overall: Dict[str, Metrics]
     by_ratio: Dict[float, Dict[str, Metrics]]
     cross_pol: CrossPolDiagnostics | None = None
+    cross_models: CrossModelDiagnostics | None = None
+
+
+def _surface_to_i2em(surface_type: int) -> tuple[int, float]:
+    if surface_type == 1:  # Gaussian correlation
+        return 2, 0.0
+    if surface_type == 2:  # Exponential correlation
+        return 1, 0.0
+    if surface_type == 3:  # 1.5 power-law
+        return 3, 1.5
+    raise ValueError(f"Unsupported surface_type={surface_type} for I2EM mapping")
 
 
 def _run_comparison(
@@ -428,6 +589,8 @@ def _run_comparison(
 
     component_entries: List[CrossPolComponentEntry] = []
     component_entries_by_ratio: Dict[float, List[CrossPolComponentEntry]] = {}
+    cross_model_entries: List[CrossModelEntry] = []
+    cross_model_entries_by_ratio: Dict[float, List[CrossModelEntry]] = {}
 
     processed = 0
 
@@ -464,11 +627,19 @@ def _run_comparison(
             corr_len=corr_len,
         )
         model = AIEMModel(params)
-        totals_linear = model.sigma0_total()
+        single_breakdown = model.sigma0_single()
+        totals_linear = dict(single_breakdown.total)
+        if include_multiple:
+            multiple_contrib = model.sigma0_multiple()
+            for pol in totals_linear:
+                totals_linear[pol] += multiple_contrib.get(pol, 0.0)
 
         hh_lin = float(totals_linear["hh"])
         vv_lin = float(totals_linear["vv"])
         hv_lin = float(totals_linear["hv"])
+
+        hv_single_lin = float(single_breakdown.total["hv"])
+        hv_multiple_lin = hv_lin - hv_single_lin
 
         hh_db = AIEMModel._to_db(hh_lin)
         vv_db = AIEMModel._to_db(vv_lin)
@@ -512,6 +683,65 @@ def _run_comparison(
             component_entries.append(entry)
             component_entries_by_ratio.setdefault(ratio, []).append(entry)
 
+        if diagnose_cross_pol:
+            hv_i2em_linear: float | None = None
+            hv_spm_linear: float | None = None
+
+            try:
+                sp, xx = _surface_to_i2em(surface_type)
+            except ValueError:
+                sp, xx = 1, 0.0
+
+            try:
+                _, _, hv_i2em_db, _ = I2EM_Bistat_model(
+                    frequency_ghz,
+                    sigma,
+                    corr_len,
+                    incidence_deg,
+                    incidence_deg,
+                    phi_deg,
+                    complex(eps_r, eps_i),
+                    sp,
+                    xx,
+                )
+                hv_i2em_linear = float(10.0 ** (hv_i2em_db / 10.0))
+            except Exception as exc:  # pragma: no cover - diagnostic helper
+                logger.debug(
+                    "I2EM evaluation failed for ratio %.3f: %s",
+                    ratio,
+                    exc,
+                    exc_info=True,
+                )
+
+            try:
+                spm_model = SPM3D(
+                    fr=frequency_ghz,
+                    sig=sigma,
+                    L=corr_len,
+                    thi=incidence_deg,
+                    eps=complex(eps_r, eps_i),
+                )
+                _, _, hv_spm_val, _ = spm_model.calc_sigma(todB=False)
+                hv_spm_linear = float(hv_spm_val)
+            except Exception as exc:  # pragma: no cover - diagnostic helper
+                logger.debug(
+                    "SPM3D evaluation failed for ratio %.3f: %s",
+                    ratio,
+                    exc,
+                    exc_info=True,
+                )
+
+            model_entry = CrossModelEntry(
+                ratio=ratio,
+                hv_aiem_single=hv_single_lin,
+                hv_aiem_multiple=hv_multiple_lin,
+                hv_aiem_total=hv_lin,
+                hv_i2em=hv_i2em_linear,
+                hv_spm=hv_spm_linear,
+            )
+            cross_model_entries.append(model_entry)
+            cross_model_entries_by_ratio.setdefault(ratio, []).append(model_entry)
+
         processed += 1
 
     overall_metrics = {
@@ -525,13 +755,23 @@ def _run_comparison(
             for pol in model_dict
         }
 
-    diagnostics = None
+    cross_pol_diag = None
     if include_multiple and diagnose_cross_pol:
-        diagnostics = CrossPolDiagnostics(
+        cross_pol_diag = CrossPolDiagnostics(
             overall=_aggregate_component_entries(component_entries),
             by_ratio={
                 ratio_value: _aggregate_component_entries(entries)
                 for ratio_value, entries in component_entries_by_ratio.items()
+            },
+        )
+
+    cross_model_diag = None
+    if diagnose_cross_pol:
+        cross_model_diag = CrossModelDiagnostics(
+            overall=_aggregate_cross_model_entries(cross_model_entries),
+            by_ratio={
+                ratio_value: _aggregate_cross_model_entries(entries)
+                for ratio_value, entries in cross_model_entries_by_ratio.items()
             },
         )
 
@@ -544,7 +784,12 @@ def _run_comparison(
         per_case,
     )
 
-    return ComparisonResult(overall=overall_metrics, by_ratio=by_ratio, cross_pol=diagnostics)
+    return ComparisonResult(
+        overall=overall_metrics,
+        by_ratio=by_ratio,
+        cross_pol=cross_pol_diag,
+        cross_models=cross_model_diag,
+    )
 
 
 def _prepare_kirchhoff_cases(
@@ -788,6 +1033,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for ratio in sorted(result.cross_pol.by_ratio):
                     label = f"ℓ/σ={ratio:g}"
                     print(result.cross_pol.by_ratio[ratio].format_row(label))
+
+        if result.cross_models is not None:
+            print("\nCross-pol model sanity (mean NRCS in dB)")
+            print(result.cross_models.overall.format_row("Overall"))
+            if result.cross_models.by_ratio:
+                for ratio in sorted(result.cross_models.by_ratio):
+                    label = f"ℓ/σ={ratio:g}"
+                    print(result.cross_models.by_ratio[ratio].format_row(label))
 
     run_sanity = args.sanity_kirchhoff or args.diagnose_cross_pol
     if run_sanity:
