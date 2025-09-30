@@ -116,14 +116,17 @@ class CrossPolDiagnostics:
     by_ratio: Dict[float, CrossPolComponentStats]
 
 
+POLARISATIONS = ("vv", "hh", "hv")
+
+
 @dataclass
 class CrossModelEntry:
     ratio: float
-    hv_aiem_single: float
-    hv_aiem_multiple: float
-    hv_aiem_total: float
-    hv_i2em: float | None
-    hv_spm: float | None
+    aiem_single: Dict[str, float]
+    aiem_multiple: Dict[str, float]
+    aiem_total: Dict[str, float]
+    i2em: Dict[str, float | None]
+    spm: Dict[str, float | None]
 
 
 @dataclass
@@ -158,8 +161,7 @@ class SignedStatistic:
 
 
 @dataclass
-class CrossModelStats:
-    count: int
+class CrossModelPolStats:
     aiem_single: SignedStatistic
     aiem_multiple: SignedStatistic
     aiem_total: SignedStatistic
@@ -168,7 +170,9 @@ class CrossModelStats:
     aiem_minus_i2em_db: float | None
     aiem_minus_spm_db: float | None
 
-    def format_row(self, label: str) -> str:  # pragma: no cover - presentation helper
+    def format_row(
+        self, label_prefix: str, pol_label: str, count: int
+    ) -> str:  # pragma: no cover - presentation helper
         def _format_optional(stat: SignedStatistic | None) -> str:
             return stat.format_db() if stat is not None else "   n/a "
 
@@ -178,7 +182,7 @@ class CrossModelStats:
             return f"{value:+6.2f} dB"
 
         return (
-            f"{label:<8s} n={self.count:3d}  "
+            f"{label_prefix}pol={pol_label:<2s} n={count:3d}  "
             f"AIEM(s)={self.aiem_single.format_db():>8s}  "
             f"AIEM(m)={self.aiem_multiple.format_db():>8s}  "
             f"AIEM(t)={self.aiem_total.format_db():>8s}  "
@@ -187,6 +191,28 @@ class CrossModelStats:
             f"Δ(I2EM)={_format_diff(self.aiem_minus_i2em_db):>8s}  "
             f"Δ(SPM)={_format_diff(self.aiem_minus_spm_db):>8s}"
         )
+
+
+@dataclass
+class CrossModelStats:
+    count: int
+    per_pol: Dict[str, CrossModelPolStats]
+
+    def format_rows(self, label: str) -> List[str]:  # pragma: no cover - presentation helper
+        if self.count == 0 or not self.per_pol:
+            return [f"{label:<8s} n=  0  (no data)"]
+
+        rows: List[str] = []
+        first = True
+        for pol in POLARISATIONS:
+            stats = self.per_pol.get(pol)
+            if stats is None:
+                continue
+            prefix = f"{label:<8s} " if first else " " * 9
+            first = False
+            rows.append(stats.format_row(prefix, pol.upper(), self.count))
+
+        return rows
 
 
 @dataclass
@@ -464,68 +490,83 @@ def _aggregate_cross_model_entries(
 ) -> CrossModelStats:
     entry_list = list(entries)
     if not entry_list:
-        empty = SignedStatistic.from_values(())
-        return CrossModelStats(
-            count=0,
-            aiem_single=empty,
-            aiem_multiple=empty,
-            aiem_total=empty,
-            i2em=None,
-            spm=None,
-            aiem_minus_i2em_db=None,
-            aiem_minus_spm_db=None,
-        )
+        return CrossModelStats(count=0, per_pol={})
 
     count = len(entry_list)
-    aiem_single = SignedStatistic.from_values([e.hv_aiem_single for e in entry_list])
-    aiem_multiple = SignedStatistic.from_values([e.hv_aiem_multiple for e in entry_list])
-    aiem_total = SignedStatistic.from_values([e.hv_aiem_total for e in entry_list])
+    per_pol: Dict[str, CrossModelPolStats] = {}
 
-    i2em_values = [e.hv_i2em for e in entry_list if e.hv_i2em is not None]
-    spm_values = [e.hv_spm for e in entry_list if e.hv_spm is not None]
+    for pol in POLARISATIONS:
+        aiem_single_vals = [
+            entry.aiem_single.get(pol, 0.0) for entry in entry_list
+        ]
+        aiem_multiple_vals = [
+            entry.aiem_multiple.get(pol, 0.0) for entry in entry_list
+        ]
+        aiem_total_vals = [
+            entry.aiem_total.get(pol, 0.0) for entry in entry_list
+        ]
 
-    i2em_stat = (
-        SignedStatistic.from_values(i2em_values)
-        if i2em_values
-        else None
-    )
-    spm_stat = (
-        SignedStatistic.from_values(spm_values)
-        if spm_values
-        else None
-    )
+        i2em_vals = [entry.i2em.get(pol) for entry in entry_list]
+        spm_vals = [entry.spm.get(pol) for entry in entry_list]
 
-    eps = 1e-30
-    diff_i2em = [
-        10.0 * math.log10(e.hv_aiem_total + eps)
-        - 10.0 * math.log10(e.hv_i2em + eps)
-        for e in entry_list
-        if e.hv_i2em is not None and e.hv_i2em > 0.0
-    ]
-    diff_spm = [
-        10.0 * math.log10(e.hv_aiem_total + eps)
-        - 10.0 * math.log10(e.hv_spm + eps)
-        for e in entry_list
-        if e.hv_spm is not None and e.hv_spm > 0.0
-    ]
+        finite_i2em = [
+            value for value in i2em_vals if value is not None and math.isfinite(value)
+        ]
+        finite_spm = [
+            value for value in spm_vals if value is not None and math.isfinite(value)
+        ]
 
-    mean_diff_i2em = (
-        float(sum(diff_i2em) / len(diff_i2em)) if diff_i2em else None
-    )
-    mean_diff_spm = (
-        float(sum(diff_spm) / len(diff_spm)) if diff_spm else None
-    )
+        i2em_stat = (
+            SignedStatistic.from_values(finite_i2em)
+            if finite_i2em
+            else None
+        )
+        spm_stat = (
+            SignedStatistic.from_values(finite_spm)
+            if finite_spm
+            else None
+        )
 
-    return CrossModelStats(
-        count=count,
-        aiem_single=aiem_single,
-        aiem_multiple=aiem_multiple,
-        aiem_total=aiem_total,
-        i2em=i2em_stat,
-        spm=spm_stat,
-        aiem_minus_i2em_db=mean_diff_i2em,
-        aiem_minus_spm_db=mean_diff_spm,
-    )
+        eps = 1e-30
+        diff_i2em: List[float] = []
+        diff_spm: List[float] = []
+        for entry in entry_list:
+            aiem_total = entry.aiem_total.get(pol)
+            if aiem_total is None or aiem_total <= 0.0:
+                continue
+
+            i2em_val = entry.i2em.get(pol)
+            if i2em_val is not None and i2em_val > 0.0:
+                diff_i2em.append(
+                    10.0 * math.log10(aiem_total + eps)
+                    - 10.0 * math.log10(i2em_val + eps)
+                )
+
+            spm_val = entry.spm.get(pol)
+            if spm_val is not None and spm_val > 0.0:
+                diff_spm.append(
+                    10.0 * math.log10(aiem_total + eps)
+                    - 10.0 * math.log10(spm_val + eps)
+                )
+
+        mean_diff_i2em = (
+            float(sum(diff_i2em) / len(diff_i2em)) if diff_i2em else None
+        )
+        mean_diff_spm = (
+            float(sum(diff_spm) / len(diff_spm)) if diff_spm else None
+        )
+
+        per_pol[pol] = CrossModelPolStats(
+            aiem_single=SignedStatistic.from_values(aiem_single_vals),
+            aiem_multiple=SignedStatistic.from_values(aiem_multiple_vals),
+            aiem_total=SignedStatistic.from_values(aiem_total_vals),
+            i2em=i2em_stat,
+            spm=spm_stat,
+            aiem_minus_i2em_db=mean_diff_i2em,
+            aiem_minus_spm_db=mean_diff_spm,
+        )
+
+    return CrossModelStats(count=count, per_pol=per_pol)
 
 
 @dataclass
@@ -629,6 +670,7 @@ def _run_comparison(
         model = AIEMModel(params)
         single_breakdown = model.sigma0_single()
         totals_linear = dict(single_breakdown.total)
+        multiple_contrib: Dict[str, float] = {}
         if include_multiple:
             multiple_contrib = model.sigma0_multiple()
             for pol in totals_linear:
@@ -638,8 +680,12 @@ def _run_comparison(
         vv_lin = float(totals_linear["vv"])
         hv_lin = float(totals_linear["hv"])
 
-        hv_single_lin = float(single_breakdown.total["hv"])
-        hv_multiple_lin = hv_lin - hv_single_lin
+        aiem_single_map = {pol: float(single_breakdown.total[pol]) for pol in POLARISATIONS}
+        aiem_multiple_map = {pol: float(multiple_contrib.get(pol, 0.0)) for pol in POLARISATIONS}
+        aiem_total_map = {pol: float(totals_linear[pol]) for pol in POLARISATIONS}
+
+        hv_single_lin = aiem_single_map["hv"]
+        hv_multiple_lin = aiem_multiple_map["hv"]
 
         hh_db = AIEMModel._to_db(hh_lin)
         vv_db = AIEMModel._to_db(vv_lin)
@@ -684,8 +730,8 @@ def _run_comparison(
             component_entries_by_ratio.setdefault(ratio, []).append(entry)
 
         if diagnose_cross_pol:
-            hv_i2em_linear: float | None = None
-            hv_spm_linear: float | None = None
+            i2em_linear: Dict[str, float | None] = {pol: None for pol in POLARISATIONS}
+            spm_linear: Dict[str, float | None] = {pol: None for pol in POLARISATIONS}
 
             try:
                 sp, xx = _surface_to_i2em(surface_type)
@@ -693,7 +739,7 @@ def _run_comparison(
                 sp, xx = 1, 0.0
 
             try:
-                _, _, hv_i2em_db, _ = I2EM_Bistat_model(
+                vv_i2em_db, hh_i2em_db, hv_i2em_db, _ = I2EM_Bistat_model(
                     frequency_ghz,
                     sigma,
                     corr_len,
@@ -704,7 +750,11 @@ def _run_comparison(
                     sp,
                     xx,
                 )
-                hv_i2em_linear = float(10.0 ** (hv_i2em_db / 10.0))
+                i2em_linear = {
+                    "vv": float(10.0 ** (vv_i2em_db / 10.0)),
+                    "hh": float(10.0 ** (hh_i2em_db / 10.0)),
+                    "hv": float(10.0 ** (hv_i2em_db / 10.0)),
+                }
             except Exception as exc:  # pragma: no cover - diagnostic helper
                 logger.debug(
                     "I2EM evaluation failed for ratio %.3f: %s",
@@ -721,8 +771,12 @@ def _run_comparison(
                     thi=incidence_deg,
                     eps=complex(eps_r, eps_i),
                 )
-                _, _, hv_spm_val, _ = spm_model.calc_sigma(todB=False)
-                hv_spm_linear = float(hv_spm_val)
+                vv_spm_val, hh_spm_val, hv_spm_val, _ = spm_model.calc_sigma(todB=False)
+                spm_linear = {
+                    "vv": float(vv_spm_val),
+                    "hh": float(hh_spm_val),
+                    "hv": float(hv_spm_val),
+                }
             except Exception as exc:  # pragma: no cover - diagnostic helper
                 logger.debug(
                     "SPM3D evaluation failed for ratio %.3f: %s",
@@ -733,11 +787,11 @@ def _run_comparison(
 
             model_entry = CrossModelEntry(
                 ratio=ratio,
-                hv_aiem_single=hv_single_lin,
-                hv_aiem_multiple=hv_multiple_lin,
-                hv_aiem_total=hv_lin,
-                hv_i2em=hv_i2em_linear,
-                hv_spm=hv_spm_linear,
+                aiem_single=dict(aiem_single_map),
+                aiem_multiple=dict(aiem_multiple_map),
+                aiem_total=dict(aiem_total_map),
+                i2em=dict(i2em_linear),
+                spm=dict(spm_linear),
             )
             cross_model_entries.append(model_entry)
             cross_model_entries_by_ratio.setdefault(ratio, []).append(model_entry)
@@ -1036,11 +1090,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if result.cross_models is not None:
             print("\nCross-pol model sanity (mean NRCS in dB)")
-            print(result.cross_models.overall.format_row("Overall"))
+            for line in result.cross_models.overall.format_rows("Overall"):
+                print(line)
             if result.cross_models.by_ratio:
                 for ratio in sorted(result.cross_models.by_ratio):
                     label = f"ℓ/σ={ratio:g}"
-                    print(result.cross_models.by_ratio[ratio].format_row(label))
+                    for line in result.cross_models.by_ratio[ratio].format_rows(label):
+                        print(line)
 
     run_sanity = args.sanity_kirchhoff or args.diagnose_cross_pol
     if run_sanity:
