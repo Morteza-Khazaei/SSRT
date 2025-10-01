@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Mapping, Sequence
+from typing import Callable, Dict, Mapping, Sequence
 
 import numpy as np
 
@@ -160,6 +160,39 @@ class _MultipleScatteringIntegrator:
         rad = (np.abs(q1) > qmin) | (np.abs(q2) > qmin)
         W2D = np.outer(wu, wv)
 
+        q_map = {"q1": q1, "-q1": -q1, "q2": q2, "-q2": -q2}
+
+        gkc_cache = {
+            label: (
+                _build_gkc1(U, V, self._geom_data, q_val, self.surf, self._wn, self.quad.Nmax),
+                _build_gkc2(U, V, self._geom_data, q_val, self.surf, self._wn, self.quad.Nmax),
+                _build_gkc3(U, V, self._geom_data, q_val, self.surf, self._wn, self.quad.Nmax),
+            )
+            for label, q_val in q_map.items()
+        }
+
+        eq13_combos = [
+            ("Fp", "Fp", "q1", "q1"),
+            ("Fp", "Fm", "q1", "-q1"),
+            ("Fm", "Fp", "-q1", "q1"),
+            ("Fm", "Fm", "-q1", "-q1"),
+            ("Fp", "Gp", "q1", "q2"),
+            ("Fp", "Gm", "q1", "-q2"),
+            ("Fm", "Gp", "-q1", "q2"),
+            ("Fm", "Gm", "-q1", "-q2"),
+            ("Gp", "Fp", "q2", "q1"),
+            ("Gp", "Fm", "q2", "-q1"),
+            ("Gm", "Fp", "-q2", "q1"),
+            ("Gm", "Fm", "-q2", "-q1"),
+            ("Gp", "Gp", "q2", "q2"),
+            ("Gp", "Gm", "q2", "-q2"),
+            ("Gm", "Gp", "-q2", "q2"),
+            ("Gm", "Gm", "-q2", "-q2"),
+        ]
+
+        gci_cache: Dict[tuple[int, str, str], np.ndarray] = {}
+        gcj_cache: Dict[tuple[int, str, str], np.ndarray] = {}
+
         results: Dict[str, float] = {pol: 0.0 for pol in self.pols}
         components: Dict[str, Dict[str, float]] = {
             pol: {"kc": 0.0, "c": 0.0} for pol in self.pols
@@ -172,7 +205,7 @@ class _MultipleScatteringIntegrator:
                 components[pol] = components.get("hv", {"kc": 0.0, "c": 0.0}).copy()
                 continue
 
-            propagators, kernels, integrand_c = _assemble_integrands(
+            propagators = _build_propagators(
                 U,
                 V,
                 q1,
@@ -180,21 +213,133 @@ class _MultipleScatteringIntegrator:
                 k,
                 er,
                 self._geom_data,
-                self.surf,
-                self._wn,
-                self.quad.Nmax,
                 pol,
             )
 
             field = self.fields.get(pol, 0.0)
-            K1, K2, K3 = kernels
-            kc_integrand = (
-                propagators["Fp"] * K1
-                + propagators["Fm"] * K2
-                + propagators["Gp"] * K3
-            )
-            kc_sum = np.sum(kc_integrand * rad * W2D)
+            kc_sum = 0.0 + 0.0j
+            for idx in range(3):
+                integrand_l = (
+                    propagators["Fp"] * gkc_cache["q1"][idx]
+                    + propagators["Fm"] * gkc_cache["-q1"][idx]
+                    + propagators["Gp"] * gkc_cache["q2"][idx]
+                    + propagators["Gm"] * gkc_cache["-q2"][idx]
+                )
+                kc_sum += np.sum(integrand_l * rad * W2D)
+
             kc_term = (k**2 / (8.0 * np.pi)) * np.real(np.conjugate(field) * kc_sum)
+
+            field_map = {
+                "Fp": propagators["Fp"],
+                "Fm": propagators["Fm"],
+                "Gp": propagators["Gp"],
+                "Gm": propagators["Gm"],
+            }
+            conj_map = {name: np.conjugate(arr) for name, arr in field_map.items()}
+
+            prime_cache: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
+            for i in range(1, 9):
+                u_prime, v_prime = _prime_coordinates(self._geom_data, U, V, i)
+                q1_prime = np.sqrt((k**2 - (u_prime**2 + v_prime**2)) + 0.0j)
+                q2_prime = np.sqrt(er * k**2 - (u_prime**2 + v_prime**2))
+                prime_cache[i] = {
+                    "prop": _build_propagators(
+                        u_prime,
+                        v_prime,
+                        q1_prime,
+                        q2_prime,
+                        k,
+                        er,
+                        self._geom_data,
+                        pol,
+                    ),
+                    "q": {
+                        "q1": q1_prime,
+                        "-q1": -q1_prime,
+                        "q2": q2_prime,
+                        "-q2": -q2_prime,
+                    },
+                }
+
+            nonprime_cache: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
+            for j in range(9, 15):
+                u_const, v_const = _nonprime_coordinates(self._geom_data, j)
+                u_arr = np.full_like(U, u_const, dtype=float)
+                v_arr = np.full_like(V, v_const, dtype=float)
+                q1_const = np.sqrt((k**2 - (u_const**2 + v_const**2)) + 0.0j)
+                q2_const = np.sqrt(er * k**2 - (u_const**2 + v_const**2))
+                q1_arr = np.full_like(U, q1_const, dtype=np.complex128)
+                q2_arr = np.full_like(U, q2_const, dtype=np.complex128)
+                nonprime_cache[j] = {
+                    "prop": _build_propagators(
+                        u_arr,
+                        v_arr,
+                        q1_arr,
+                        q2_arr,
+                        k,
+                        er,
+                        self._geom_data,
+                        pol,
+                    ),
+                    "q": {
+                        "q1": q1_arr,
+                        "-q1": -q1_arr,
+                        "q2": q2_arr,
+                        "-q2": -q2_arr,
+                    },
+                }
+
+            def get_gci(i: int, q_label: str, qp_label: str) -> np.ndarray:
+                key = (i, q_label, qp_label)
+                if key not in gci_cache:
+                    q_val = q_map[q_label]
+                    qp_val = prime_cache[i]["q"][qp_label]
+                    block = _build_gc_block1(
+                        U,
+                        V,
+                        self._geom_data,
+                        q_val,
+                        qp_val,
+                        self.surf,
+                        self._wn,
+                        self.quad.Nmax,
+                    )
+                    gci_cache[key] = block[f"gc{i}"]
+                return gci_cache[key]
+
+            def get_gcj(j: int, q_label: str, qp_label: str) -> np.ndarray:
+                key = (j, q_label, qp_label)
+                if key not in gcj_cache:
+                    q_val = nonprime_cache[j]["q"][q_label]
+                    qp_val = q_map[qp_label]
+                    block = _build_gc_block2(
+                        U,
+                        V,
+                        self._geom_data,
+                        q_val,
+                        qp_val,
+                        self.surf,
+                        self._wn,
+                        self.quad.Nmax,
+                    )
+                    gcj_cache[key] = block[f"gc{j}"]
+                return gcj_cache[key]
+
+            integrand_c = np.zeros_like(U, dtype=np.complex128)
+
+            for i in range(1, 9):
+                prime_prop = prime_cache[i]["prop"]
+                conj_prime = {name: np.conjugate(val) for name, val in prime_prop.items()}
+                for field_a, field_b, q_label, qp_label in eq13_combos:
+                    g_val = get_gci(i, q_label, qp_label)
+                    integrand_c += field_map[field_a] * conj_prime[field_b] * g_val
+
+            for j in range(9, 15):
+                const_prop = nonprime_cache[j]["prop"]
+                for field_a, field_b, q_label, qp_label in eq13_combos:
+                    g_val = get_gcj(j, q_label, qp_label)
+                    integrand_c += const_prop[field_a] * conj_map[field_b] * g_val
+
             c_sum = np.sum(integrand_c * rad * W2D)
             c_term = (k**2 / (64.0 * np.pi)) * np.real(c_sum)
 
@@ -235,6 +380,7 @@ def _prepare_geometry_terms(geom: Geometry, phys: Physics) -> Dict[str, float]:
         "theta_s": geom.theta_s,
         "phi_i": geom.phi_i,
         "phi_s": geom.phi_s,
+        "k": phys.k,
         "sin_theta_s": sin_theta_s,
         "cos_theta_s": cos_theta_s,
         "sin_phi_s": sin_phi_s,
@@ -250,6 +396,37 @@ def _prepare_geometry_terms(geom: Geometry, phys: Physics) -> Dict[str, float]:
         "ksy": k * sin_theta_s * sin_phi_s,
         "ksz": k * cos_theta_s,
     }
+
+
+def _prime_coordinates(
+    geom: Dict[str, float], U: np.ndarray, V: np.ndarray, index: int
+) -> tuple[np.ndarray, np.ndarray]:
+    if index == 1:
+        return U, V
+    if index == 2:
+        return (
+            -(geom["kx"] + geom["ksx"]) - U,
+            -(geom["ky"] + geom["ksy"]) - V,
+        )
+    if index in (3, 4, 5):
+        return (
+            np.full_like(U, -geom["ksx"], dtype=float),
+            np.full_like(V, -geom["ksy"], dtype=float),
+        )
+    if index in (6, 7, 8):
+        return (
+            np.full_like(U, -geom["kx"], dtype=float),
+            np.full_like(V, -geom["ky"], dtype=float),
+        )
+    raise ValueError(f"Invalid index for q' mapping: {index}")
+
+
+def _nonprime_coordinates(geom: Dict[str, float], index: int) -> tuple[float, float]:
+    if index in (9, 10, 11):
+        return -geom["ksx"], -geom["ksy"]
+    if index in (12, 13, 14):
+        return -geom["kx"], -geom["ky"]
+    raise ValueError(f"Invalid index for q mapping: {index}")
 
 
 def _make_Wn_provider(surf: Surface) -> Callable[[np.ndarray, np.ndarray, int], np.ndarray]:
@@ -271,48 +448,6 @@ def _make_Wn_provider(surf: Surface) -> Callable[[np.ndarray, np.ndarray, int], 
 
     return provider
 
-
-def _assemble_integrands(
-    U: np.ndarray,
-    V: np.ndarray,
-    q1: np.ndarray,
-    q2: np.ndarray,
-    k: float,
-    er: complex,
-    geom_data: Dict[str, float],
-    surf: Surface,
-    wn_provider: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
-    Nmax: int,
-    pol: str,
-) -> tuple[Dict[str, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
-    propagators = _build_propagators(U, V, q1, q2, k, er, geom_data, pol)
-
-    K1 = _build_gkc1(U, V, geom_data, q1, surf, wn_provider, Nmax)
-    K2 = _build_gkc2(U, V, geom_data, q1, surf, wn_provider, Nmax)
-    K3 = _build_gkc3(U, V, geom_data, q1, surf, wn_provider, Nmax)
-
-    C1 = _build_gc_block1(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
-    C2 = _build_gc_block2(U, V, geom_data, q1, q1, surf, wn_provider, Nmax)
-
-    Int_c = np.zeros_like(U, dtype=np.complex128)
-    P = propagators
-    Int_c += (P["Fp"] * np.conjugate(P["Fp"])) * C1["gc1"]
-    Int_c += (P["Fp"] * np.conjugate(P["Fm"])) * C1["gc2"]
-    Int_c += (P["Fm"] * np.conjugate(P["Fp"])) * C1["gc3"]
-    Int_c += (P["Fm"] * np.conjugate(P["Fm"])) * C1["gc4"]
-    Int_c += (P["Gp"] * np.conjugate(P["Gp"])) * C1["gc5"]
-    Int_c += (P["Gp"] * np.conjugate(P["Gm"])) * C1["gc6"]
-    Int_c += (P["Gm"] * np.conjugate(P["Gp"])) * C1["gc7"]
-    Int_c += (P["Gm"] * np.conjugate(P["Gm"])) * C1["gc8"]
-
-    Int_c += (P["Fp"] * np.conjugate(P["Gp"])) * C2["gc9"]
-    Int_c += (P["Fp"] * np.conjugate(P["Gm"])) * C2["gc10"]
-    Int_c += (P["Fm"] * np.conjugate(P["Gp"])) * C2["gc11"]
-    Int_c += (P["Fm"] * np.conjugate(P["Gm"])) * C2["gc12"]
-    Int_c += (P["Gp"] * np.conjugate(P["Fp"])) * C2["gc13"]
-    Int_c += (P["Gm"] * np.conjugate(P["Fp"])) * C2["gc14"]
-
-    return propagators, (K1, K2, K3), Int_c
 
 def _build_propagators(
     U: np.ndarray,
